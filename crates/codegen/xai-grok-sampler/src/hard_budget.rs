@@ -137,6 +137,9 @@ pub struct HardTokenBudgetStatus {
     pub outstanding_tokens: u64,
     pub remaining_tokens: u64,
     pub violated: bool,
+    /// Durable observation revision paired with `next_sequence` for receipt
+    /// cursors. Both values are read while the shared ledger lock is held.
+    pub ledger_revision: u64,
     pub next_sequence: u64,
     pub manifest_sha256: String,
     pub allocation_id: Option<String>,
@@ -417,7 +420,10 @@ impl HardTokenBudget {
                 allocation,
             }),
         };
-        budget.with_locked_state(|_| Ok(()))?;
+        // Opening validates the authority-owned ledger without materializing a
+        // pristine empty `O_EXCL` file. The first reservation is the first
+        // mutation that writes canonical ledger JSON.
+        budget.with_locked_read_state(|_| Ok(()))?;
         Ok(budget)
     }
 
@@ -580,7 +586,7 @@ impl HardTokenBudget {
 
     pub fn status(&self) -> Result<HardTokenBudgetStatus, HardTokenBudgetError> {
         let mut result = None;
-        self.with_locked_state(|state| {
+        self.with_locked_read_state(|state| {
             let outstanding_tokens = outstanding_tokens(state)?;
             let charged = state
                 .settled_tokens
@@ -608,6 +614,7 @@ impl HardTokenBudget {
                 outstanding_tokens,
                 remaining_tokens: state.ceiling_tokens.saturating_sub(charged),
                 violated: state.violated,
+                ledger_revision: state.revision,
                 next_sequence: state.next_sequence,
                 manifest_sha256: state.manifest_sha256.clone(),
                 allocation_id: self
@@ -769,6 +776,14 @@ impl HardTokenBudget {
             Ok(mut file) => {
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)?;
+                // The authority may pre-create the private ledger with
+                // `O_EXCL` before the CLI has a mutation to persist. Only an
+                // exactly empty regular private file is a pristine ledger;
+                // whitespace and every non-empty malformed payload remain
+                // rejected by serde below.
+                if bytes.is_empty() {
+                    return Ok(self.pristine_state());
+                }
                 let state: LedgerState = serde_json::from_slice(&bytes)?;
                 if state.version != LEDGER_VERSION
                     || state.campaign_id != self.inner.campaign_id
@@ -782,19 +797,23 @@ impl HardTokenBudget {
             Err(HardTokenBudgetError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound =>
             {
-                Ok(LedgerState {
-                    version: LEDGER_VERSION,
-                    campaign_id: self.inner.campaign_id.clone(),
-                    ceiling_tokens: self.inner.ceiling_tokens,
-                    manifest_sha256: self.inner.manifest_sha256.clone(),
-                    next_sequence: 1,
-                    revision: 0,
-                    settled_tokens: 0,
-                    violated: false,
-                    reservations: Vec::new(),
-                })
+                Ok(self.pristine_state())
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn pristine_state(&self) -> LedgerState {
+        LedgerState {
+            version: LEDGER_VERSION,
+            campaign_id: self.inner.campaign_id.clone(),
+            ceiling_tokens: self.inner.ceiling_tokens,
+            manifest_sha256: self.inner.manifest_sha256.clone(),
+            next_sequence: 1,
+            revision: 0,
+            settled_tokens: 0,
+            violated: false,
+            reservations: Vec::new(),
         }
     }
 
@@ -1153,6 +1172,70 @@ mod tests {
             Err(HardTokenBudgetError::Exhausted)
         ));
         assert_eq!(reopened.status().unwrap().outstanding_tokens, 750);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_private_authority_ledger_is_pristine_until_first_reservation() {
+        let dir = private_dir("empty-authority-ledger");
+        let ledger = dir.join("ledger.json");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&ledger)
+            .unwrap();
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            ledger.clone(),
+            "empty-authority-ledger".into(),
+            1_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 300),
+        )
+        .unwrap();
+
+        let status = budget.status().unwrap();
+        assert_eq!(status.next_sequence, 1);
+        assert_eq!(status.ledger_revision, 0);
+        assert!(fs::read(&ledger).unwrap().is_empty());
+
+        let reservation = budget
+            .reserve_authorized_request(
+                "first-dispatch",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap();
+        let persisted: LedgerState = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(persisted.next_sequence, 2);
+        assert_eq!(persisted.revision, 1);
+        drop(reservation);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nonempty_authority_ledger_is_not_treated_as_pristine() {
+        let dir = private_dir("nonempty-authority-ledger");
+        let ledger = dir.join("ledger.json");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&ledger)
+            .unwrap()
+            .write_all(b" \n")
+            .unwrap();
+        let result = HardTokenBudget::open_with_allocation_for_test(
+            ledger,
+            "nonempty-authority-ledger".into(),
+            1_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 300),
+        );
+        assert!(matches!(result, Err(HardTokenBudgetError::Malformed(_))));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1547,6 +1630,61 @@ mod tests {
         assert_eq!(delta.receipts[0].actual_tokens, Some(77));
         assert_eq!(delta.receipts[0].sequence, 1);
         assert_eq!(delta.ledger_revision, 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_cursor_projects_only_later_reservation_and_settlement() {
+        let dir = private_dir("status-receipt-cursor");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "status-receipt-cursor".into(),
+            1_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 300),
+        )
+        .unwrap();
+        budget
+            .reserve_authorized_request(
+                "before-status",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap()
+            .settle(50)
+            .unwrap();
+
+        let cursor = budget.status().unwrap();
+        assert_eq!(cursor.next_sequence, 2);
+        assert_eq!(cursor.ledger_revision, 2);
+
+        budget
+            .reserve_authorized_request(
+                "after-status",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap()
+            .settle(75)
+            .unwrap();
+
+        let delta = budget
+            .receipts(&HardTokenReceiptQuery {
+                baseline_sequence: cursor.next_sequence,
+                baseline_revision: cursor.ledger_revision,
+                ..receipt_query(&budget)
+            })
+            .unwrap();
+        assert_eq!(delta.receipts.len(), 1);
+        assert_eq!(delta.receipts[0].sequence, 2);
+        assert_eq!(delta.receipts[0].provider_request_id, "after-status");
+        assert_eq!(delta.receipts[0].actual_tokens, Some(75));
         fs::remove_dir_all(dir).unwrap();
     }
 
