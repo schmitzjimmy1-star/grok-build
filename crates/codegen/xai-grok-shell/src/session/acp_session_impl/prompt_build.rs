@@ -399,6 +399,13 @@ pub(super) const ELISION_MARKER: &str =
     "\n\n…[middle truncated — full text in the offloaded file]…\n\n";
 /// Stable marker opening the offload notice. Single source of truth (for a future strip-on-re-read).
 pub(super) const OFFLOAD_NOTICE_MARKER: &str = "[Full request offloaded to file]";
+
+/// Armed budget packets are immutable, pre-accounted inputs.  They must never
+/// be rewritten into a filesystem-backed prompt, even if a future caller skips
+/// the primary turn-path guard.
+pub(super) fn should_offload_large_prompt(verbatim: bool, hard_budget_armed: bool) -> bool {
+    !verbatim && !hard_budget_armed
+}
 /// In-band notice that REPLACES the offload notice when the full request could
 /// not be persisted to the session file (write error or task-join failure).
 /// References no path — there is no file to read — so the model is never told to
@@ -893,6 +900,9 @@ impl SessionActor {
             &skill_information,
             is_cursor,
         );
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return (full_message, None);
+        }
         if full_message.len() <= LARGE_PROMPT_THRESHOLD {
             return (full_message, None);
         }
