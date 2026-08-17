@@ -27,6 +27,18 @@ struct BudgetCapability {
     cancel_conservative: bool,
     crash_conservative: bool,
     no_automatic_retry: bool,
+    sampler_transport_retries_disabled: bool,
+    auth_provider_helpers_disabled: bool,
+    terminal_disabled: bool,
+    external_mcp_disabled: bool,
+    hooks_disabled: bool,
+    plugins_disabled: bool,
+    lsp_disabled: bool,
+    workflows_disabled: bool,
+    scheduler_disabled: bool,
+    protected_authority_fs: bool,
+    workspace_fs_confined: bool,
+    allowed_tool_ids: &'static [&'static str],
     cli_build: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<xai_grok_sampler::HardTokenBudgetStatus>,
@@ -61,7 +73,32 @@ fn capability() -> BudgetCapability {
         process_shared: true,
         cancel_conservative: true,
         crash_conservative: true,
-        no_automatic_retry: true,
+        // Retained for schema compatibility. The fork proves sampler transport
+        // retries are disabled, not that every shell-level auxiliary sample is
+        // globally impossible.
+        no_automatic_retry: false,
+        sampler_transport_retries_disabled: armed,
+        auth_provider_helpers_disabled: armed,
+        terminal_disabled: armed,
+        external_mcp_disabled: armed,
+        hooks_disabled: armed,
+        plugins_disabled: armed,
+        lsp_disabled: armed,
+        workflows_disabled: armed,
+        scheduler_disabled: armed,
+        protected_authority_fs: armed,
+        workspace_fs_confined: armed,
+        allowed_tool_ids: if armed {
+            &[
+                "GrokBuild:read_file",
+                "GrokBuild:task",
+                "GrokBuild:get_task_output",
+                "GrokBuild:wait_tasks",
+                "GrokBuild:kill_task",
+            ]
+        } else {
+            &[]
+        },
         cli_build: xai_grok_version::full_version().to_string(),
         status,
         route,
@@ -82,7 +119,7 @@ fn capability() -> BudgetCapability {
             Err(_) => base(true, false, None, None, None, Some("status-unavailable")),
         },
         Err(_) => base(
-            false,
+            xai_grok_tools::util::hard_budget_environment_present(),
             false,
             None,
             None,
@@ -111,6 +148,8 @@ mod tests {
         assert_eq!(value["capabilityVersion"], 1);
         assert_eq!(value["armed"], false);
         assert_eq!(value["enforcementPoint"], "sampler-pre-dispatch");
-        assert_eq!(value["noAutomaticRetry"], true);
+        assert_eq!(value["noAutomaticRetry"], false);
+        assert_eq!(value["terminalDisabled"], false);
+        assert_eq!(value["externalMcpDisabled"], false);
     }
 }

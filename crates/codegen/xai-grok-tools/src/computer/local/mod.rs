@@ -1,8 +1,10 @@
 pub mod cgroup;
+pub mod denied_terminal;
 #[cfg(unix)]
 pub mod embedded_search_tools;
 pub mod file_system;
 pub mod mock_fs;
+pub mod protected_file_system;
 #[cfg(unix)]
 pub mod shell_state;
 #[cfg(unix)]
@@ -14,8 +16,10 @@ pub mod terminal;
 mod terminal_snapshot_tests;
 
 pub use cgroup::{CgroupMemoryConfig, PROCESS_OOM_EXIT_CODE};
+pub use denied_terminal::DeniedTerminalBackend;
 pub use file_system::LocalFs;
 pub use mock_fs::MockFs;
+pub use protected_file_system::ProtectedLocalFs;
 pub use terminal::{ExitStatus, LocalTerminalBackend};
 
 /// Per-backend enable state for the bash-harness `find`→`bfs` / `grep`→`ugrep`

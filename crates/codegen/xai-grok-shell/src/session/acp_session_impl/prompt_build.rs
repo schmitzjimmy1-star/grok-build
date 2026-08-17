@@ -549,6 +549,13 @@ impl SessionActor {
             .map(|s| s.as_str())
             .unwrap_or(&self.session_info.cwd);
         let cwd = std::path::Path::new(display_path);
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            let out = construct_user_message_minimal(cwd, None);
+            self.last_announced_local_date
+                .set(chrono::Local::now().date_naive());
+            self.prefix_carries_fallback_date.set(false);
+            return out;
+        }
         use xai_grok_agent::prompt::user_message::UserMessageTemplate;
         let (template, include_verification) = {
             let agent = self.agent.borrow();
@@ -570,13 +577,17 @@ impl SessionActor {
                     "templated user message render failed; falling back to legacy prefix"
                 );
                 prefix_carries_fallback_date = !template.surfaces_local_date();
-                if self.startup_hints.skip_git_status {
+                if self.startup_hints.skip_git_status
+                    || xai_grok_tools::util::hard_budget_environment_present()
+                {
                     construct_user_message_minimal(cwd, None)
                 } else {
                     construct_user_message(cwd, self.vcs_kind, None, None).await
                 }
             }
-        } else if self.startup_hints.skip_git_status {
+        } else if self.startup_hints.skip_git_status
+            || xai_grok_tools::util::hard_budget_environment_present()
+        {
             construct_user_message_minimal(cwd, None)
         } else {
             construct_user_message(cwd, self.vcs_kind, None, None).await
@@ -705,6 +716,9 @@ impl SessionActor {
         &self,
         cwd: &std::path::Path,
     ) -> (Option<std::path::PathBuf>, Option<String>) {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return (None, None);
+        }
         use xai_grok_workspace::file_system::{git_status_short, jj_status};
         use xai_grok_workspace::session::git::VcsKind;
         if matches!(self.vcs_kind, VcsKind::None) {

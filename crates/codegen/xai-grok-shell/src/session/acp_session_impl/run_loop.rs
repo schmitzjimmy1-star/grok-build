@@ -758,14 +758,16 @@ pub(super) async fn run_session(
                             title,
                             level,
                         } => {
-                            session
-                                .dispatch_notification_hook(
-                                    &notification_type,
-                                    message,
-                                    title,
-                                    level,
-                                )
-                                .await;
+                            if !xai_grok_tools::util::hard_budget_environment_present() {
+                                session
+                                    .dispatch_notification_hook(
+                                        &notification_type,
+                                        message,
+                                        title,
+                                        level,
+                                    )
+                                    .await;
+                            }
                         }
                         SessionCommand::DropMonitorNotifications { task_id } => {
                             // Discard pending + mid-turn-buffered monitor events
@@ -1220,6 +1222,14 @@ pub(super) async fn run_session(
                             session.apply_attach_policy(&startup_hints);
                         }
                         SessionCommand::UpdateMcpServers { mcp_servers, respond_to } => {
+                            if xai_grok_tools::util::hard_budget_environment_present()
+                                && !mcp_servers.is_empty()
+                            {
+                                let _ = respond_to.send(Err(acp::Error::invalid_request().data(
+                                    "MCP attachment is disabled while the hard-token budget is armed",
+                                )));
+                                continue;
+                            }
                             if session.startup_hints.is_subagent {
                                 tracing::debug!(
                                     session_id = %session.session_info.id.0,
@@ -1308,6 +1318,12 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpServer { server_name, enabled, server_config, respond_to } => {
+                            if xai_grok_tools::util::hard_budget_environment_present() && enabled {
+                                let _ = respond_to.send(Err(acp::Error::invalid_request().data(
+                                    "MCP enablement is disabled while the hard-token budget is armed",
+                                )));
+                                continue;
+                            }
                             session.events.emit(xai_grok_session_events::Event::McpServerToggled {
                                 server_name: server_name.clone(),
                                 enabled,
@@ -1411,6 +1427,12 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ToggleMcpTool { server_name, tool_name, enabled, is_managed_gateway, respond_to } => {
+                            if xai_grok_tools::util::hard_budget_environment_present() && enabled {
+                                let _ = respond_to.send(Err(acp::Error::invalid_request().data(
+                                    "MCP tool enablement is disabled while the hard-token budget is armed",
+                                )));
+                                continue;
+                            }
                             if is_managed_gateway {
                                 let mut disabled_tools = crate::util::config::get_all_mcp_disabled_tools(std::path::Path::new(&session.session_info.cwd));
                                 if tool_name.is_empty() {
@@ -1626,7 +1648,11 @@ pub(super) async fn run_session(
                             let _ = respond_to.send(specs);
                         }
                         SessionCommand::SetClientHooks { hooks } => {
-                            *session.client_hooks.borrow_mut() = hooks;
+                            if xai_grok_tools::util::hard_budget_environment_present() {
+                                session.client_hooks.borrow_mut().clear();
+                            } else {
+                                *session.client_hooks.borrow_mut() = hooks;
+                            }
                         }
                         SessionCommand::GetMcpStatus { respond_to } => {
                             let mcp_state = session.mcp_state.clone();
@@ -2175,7 +2201,7 @@ pub(super) async fn run_session(
                     // opt-in. Spawned via `spawn_local` so the actor
                     // loop can continue accepting commands while the
                     // classifier idle-waits.
-                    {
+                    if !xai_grok_tools::util::hard_budget_environment_present() {
                         let s = session.clone();
                         tokio::task::spawn_local(async move {
                             s.maybe_fire_laziness_check().await;

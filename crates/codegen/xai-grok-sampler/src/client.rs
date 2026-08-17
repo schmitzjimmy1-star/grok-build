@@ -3040,6 +3040,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_budget_allows_tool_loop_followups_with_the_same_provider_turn_id() {
+        let (base_url, calls, server) = chat_server().await;
+        let dir = private_budget_dir("same-turn-tool-loop");
+        let mut allocation = chat_allocation(&base_url, 600);
+        allocation.token_ceiling = 1_200;
+        allocation.max_model_calls = 2;
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "same-turn-tool-loop".into(),
+            1_200,
+            "d".repeat(64),
+            allocation,
+        )
+        .unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url,
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget.clone()),
+        )
+        .unwrap();
+
+        let request = test_chat_request();
+        client.chat_completion(request.clone()).await.unwrap();
+        client.chat_completion(request.clone()).await.unwrap();
+        assert!(client.chat_completion(request).await.is_err());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let status = budget.status().unwrap();
+        assert_eq!(status.allocation_remaining_calls, Some(0));
+        assert_eq!(status.settled_tokens, 100);
+        assert_eq!(status.outstanding_tokens, 0);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn hard_budget_does_not_follow_provider_redirects() {
         let redirected_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let target_calls = std::sync::Arc::clone(&redirected_calls);

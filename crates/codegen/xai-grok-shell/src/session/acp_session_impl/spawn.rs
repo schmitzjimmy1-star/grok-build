@@ -62,6 +62,41 @@ fn configured_memory_retrieval_mode(
         Some(_) => FtsOnly,
     }
 }
+
+fn hard_budget_authority_roots() -> Result<Vec<std::path::PathBuf>, xai_grok_agent::AgentBuildError>
+{
+    let mut roots = Vec::new();
+    for name in [
+        xai_grok_tools::util::HARD_BUDGET_LEDGER_ENV,
+        xai_grok_tools::util::HARD_BUDGET_MANIFEST_ENV,
+    ] {
+        let path = std::env::var_os(name).ok_or_else(|| {
+            xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                "hard-token-budget contract is missing {name}"
+            ))
+        })?;
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                "hard-token-budget authority path must be absolute: {name}"
+            )));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                "hard-token-budget authority path has no parent: {name}"
+            ))
+        })?;
+        let canonical = std::fs::canonicalize(parent).map_err(|error| {
+            xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                "hard-token-budget authority directory is unavailable: {error}"
+            ))
+        })?;
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
+    Ok(roots)
+}
 #[cfg(all(test, unix))]
 #[path = "spawn_runtime_containment_tests.rs"]
 mod runtime_containment_tests;
@@ -255,6 +290,109 @@ pub(crate) async fn spawn_session_actor(
     ),
     xai_grok_agent::AgentBuildError,
 > {
+    let hard_budget_restricted = xai_grok_tools::util::hard_budget_environment_present();
+    let persisted_plan_mode = (!hard_budget_restricted)
+        .then_some(persisted_plan_mode)
+        .flatten();
+    let persisted_goal_mode = (!hard_budget_restricted)
+        .then_some(persisted_goal_mode)
+        .flatten();
+    let telemetry_enabled = telemetry_enabled && !hard_budget_restricted;
+    let loc_tracking_enabled = loc_tracking_enabled && !hard_budget_restricted;
+    let feedback_proxy_url = (!hard_budget_restricted)
+        .then_some(feedback_proxy_url)
+        .flatten();
+    let feedback_flags = if hard_budget_restricted {
+        crate::session::feedback_manager::FeedbackFlags::default()
+    } else {
+        feedback_flags
+    };
+    let (hard_budget_authority_roots, hard_budget_workspace_root) = if hard_budget_restricted {
+        match xai_grok_sampler::HardTokenBudget::from_env() {
+            Ok(Some(_)) => {
+                let roots = hard_budget_authority_roots()?;
+                let workspace =
+                    std::fs::canonicalize(tool_context.cwd.as_path()).map_err(|error| {
+                        xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                            "hard-token-budget workspace is unavailable: {error}"
+                        ))
+                    })?;
+                if roots
+                    .iter()
+                    .any(|root| root.starts_with(&workspace) || workspace.starts_with(root))
+                {
+                    return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
+                        "hard-token-budget authority and workspace directories must be disjoint"
+                            .to_string(),
+                    ));
+                }
+                (roots, Some(workspace))
+            }
+            Ok(None) => {
+                return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
+                    "hard-token-budget restriction is active without a complete contract"
+                        .to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                    "hard-token-budget contract is invalid: {error}"
+                )));
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    if hard_budget_restricted {
+        let active_plugins = plugin_registry
+            .as_ref()
+            .map_or(0, |registry| registry.active_plugins().len());
+        if !mcp_servers.is_empty()
+            || !initial_client_mcp_servers.is_empty()
+            || !acp_mcp_servers.is_empty()
+            || parent_mcp_pool.is_some()
+            || active_plugins > 0
+        {
+            return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
+                "hard-token-budget mode requires zero external MCP servers and active plugins"
+                    .to_string(),
+            ));
+        }
+    }
+    let memory_config = (!hard_budget_restricted).then_some(memory_config).flatten();
+    let persisted_workflow_runs = if hard_budget_restricted {
+        Vec::new()
+    } else {
+        persisted_workflow_runs
+    };
+    let background_workflows_enabled = background_workflows_enabled && !hard_budget_restricted;
+    let disable_web_search = disable_web_search || hard_budget_restricted;
+    let backend_tools_enabled = backend_tools_enabled && !hard_budget_restricted;
+    let write_file_enabled = write_file_enabled && !hard_budget_restricted;
+    let ask_user_question_enabled = ask_user_question_enabled && !hard_budget_restricted;
+    let client_hooks = if hard_budget_restricted {
+        Default::default()
+    } else {
+        client_hooks
+    };
+    let hook_registry_override = if hard_budget_restricted {
+        None
+    } else {
+        hook_registry_override
+    };
+    let plugin_registry = if hard_budget_restricted {
+        None
+    } else {
+        plugin_registry
+    };
+    let plugin_registry_handle = if hard_budget_restricted {
+        None
+    } else {
+        plugin_registry_handle
+    };
+    if hard_budget_restricted {
+        tool_context.lsp = None;
+    }
     if max_turns == Some(0) {
         return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
             "max_turns must be greater than 0".to_string(),
@@ -637,45 +775,61 @@ pub(crate) async fn spawn_session_actor(
     };
     let resolve_policy = || crate::util::config::resolve_shell_env_policy(effective_cfg.as_ref());
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
-        match terminal_backend_kind {
-            TerminalBackendKind::ReuseParent => parent_terminal_backend
-                .expect("ReuseParent is only selected when a parent backend is present"),
-            TerminalBackendKind::AcpClient => {
-                std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
-                    tool_context.gateway.clone().unwrap(),
-                    tool_context.session_id.clone().unwrap(),
-                ))
-                    as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
-            }
-            TerminalBackendKind::LocalPersistent => {
-                std::sync::Arc::new(LocalTerminalBackend::new_local_with_persistent_shell(
-                    resolve_search_shadows(),
-                    resolve_policy(),
-                    tool_context.process_scope.clone(),
-                ))
-            }
-            TerminalBackendKind::LocalNonPersistent => {
-                let login_shell_capture = crate::util::config::resolve_login_shell_capture(
-                    remote_settings.as_ref().and_then(|r| r.login_shell_capture),
-                );
-                std::sync::Arc::new(LocalTerminalBackend::new_local_with_login_shell_capture(
-                    resolve_search_shadows(),
-                    login_shell_capture,
-                    resolve_policy(),
-                    tool_context.process_scope.clone(),
-                ))
+        if hard_budget_restricted {
+            std::sync::Arc::new(xai_grok_tools::computer::local::DeniedTerminalBackend)
+        } else {
+            match terminal_backend_kind {
+                TerminalBackendKind::ReuseParent => parent_terminal_backend
+                    .expect("ReuseParent is only selected when a parent backend is present"),
+                TerminalBackendKind::AcpClient => {
+                    std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
+                        tool_context.gateway.clone().unwrap(),
+                        tool_context.session_id.clone().unwrap(),
+                    ))
+                        as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
+                }
+                TerminalBackendKind::LocalPersistent => {
+                    std::sync::Arc::new(LocalTerminalBackend::new_local_with_persistent_shell(
+                        resolve_search_shadows(),
+                        resolve_policy(),
+                        tool_context.process_scope.clone(),
+                    ))
+                }
+                TerminalBackendKind::LocalNonPersistent => {
+                    let login_shell_capture = crate::util::config::resolve_login_shell_capture(
+                        remote_settings.as_ref().and_then(|r| r.login_shell_capture),
+                    );
+                    std::sync::Arc::new(LocalTerminalBackend::new_local_with_login_shell_capture(
+                        resolve_search_shadows(),
+                        login_shell_capture,
+                        resolve_policy(),
+                        tool_context.process_scope.clone(),
+                    ))
+                }
             }
         };
-    if matches!(
-        terminal_backend_kind,
-        TerminalBackendKind::LocalPersistent | TerminalBackendKind::LocalNonPersistent
-    ) {
+    if !hard_budget_restricted
+        && matches!(
+            terminal_backend_kind,
+            TerminalBackendKind::LocalPersistent | TerminalBackendKind::LocalNonPersistent
+        )
+    {
         terminal_backend
             .warm_shell(tool_context.cwd.as_path())
             .await;
     }
     let fs_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::AsyncFileSystem> =
-        if client_fs_capable && tool_context.gateway.is_some() {
+        if hard_budget_restricted {
+            std::sync::Arc::new(
+                xai_grok_tools::computer::local::ProtectedLocalFs::new(
+                    hard_budget_authority_roots,
+                    hard_budget_workspace_root.expect("armed mode resolves a workspace root"),
+                )
+                .map_err(|error| {
+                    xai_grok_agent::AgentBuildError::InvalidConfig(error.to_string())
+                })?,
+            )
+        } else if client_fs_capable && tool_context.gateway.is_some() {
             std::sync::Arc::new(xai_grok_workspace::file_system::AcpFsAdapter::new(
                 tool_context.gateway.clone().unwrap(),
                 tool_context.session_id.clone().unwrap(),
@@ -847,11 +1001,12 @@ pub(crate) async fn spawn_session_actor(
     let context_window_tokens = context_window_override
         .map(|c| c.get())
         .unwrap_or(sampling_config.context_window);
-    let scheduler_background_loops = crate::util::config::resolve_scheduler_background_loops(
-        remote_settings
-            .as_ref()
-            .and_then(|r| r.scheduler_background_loops),
-    );
+    let scheduler_background_loops = !hard_budget_restricted
+        && crate::util::config::resolve_scheduler_background_loops(
+            remote_settings
+                .as_ref()
+                .and_then(|r| r.scheduler_background_loops),
+        );
     let managed_gateway_tool_client = auth_manager.as_ref().map(|am| {
         xai_grok_tools::types::resources::ManagedGatewayToolClient(Arc::new(
             ShellManagedGatewayToolClient {
@@ -938,12 +1093,13 @@ pub(crate) async fn spawn_session_actor(
         respect_gitignore,
         path_not_found_hints,
         scheduler_background_loops,
+        hard_budget_tool_isolation: hard_budget_restricted,
         mcp_state: mcp_state.clone(),
         managed_gateway_tool_client: managed_gateway_tool_client.clone(),
         is_non_interactive: startup_hints.non_interactive,
         system_prompt_label,
         owner_session_id: Some(session_info.id.0.to_string()),
-        parent_scheduler_handle: if startup_hints.is_subagent {
+        parent_scheduler_handle: if startup_hints.is_subagent && !hard_budget_restricted {
             parent_scheduler_handle
         } else {
             None
@@ -976,7 +1132,8 @@ pub(crate) async fn spawn_session_actor(
         .update_resource(task_wake_suppressed)
         .await;
     let memory_retrieval_mode = configured_memory_retrieval_mode(memory_config.as_ref());
-    let harness_metrics = if !startup_hints.is_subagent
+    let harness_metrics = if !hard_budget_restricted
+        && !startup_hints.is_subagent
         && (telemetry_enabled || xai_grok_telemetry::external::is_active())
     {
         let plugin_names = plugin_registry
@@ -1180,13 +1337,18 @@ pub(crate) async fn spawn_session_actor(
     let mut sampler_config_initial = sampling_config.clone();
     sampler_config_initial.idle_timeout_secs = Some(inference_idle_timeout_secs);
     let task_output_budgeted = tool_context.task_output_token_budget.is_some();
-    let retry_only_before_output =
-        task_output_budgeted || tool_context.sampler_retry_only_before_output;
+    let retry_only_before_output = hard_budget_restricted
+        || task_output_budgeted
+        || tool_context.sampler_retry_only_before_output;
     if retry_only_before_output {
         sampler_config_initial.doom_loop_recovery = None;
     }
     let sampler_retry_policy = xai_grok_sampler::RetryPolicy {
-        max_retries: max_retries.unwrap_or(5),
+        max_retries: if hard_budget_restricted {
+            0
+        } else {
+            max_retries.unwrap_or(5)
+        },
         rate_limit_retry_threshold: 2,
         retry_only_before_output,
     };
@@ -1205,7 +1367,9 @@ pub(crate) async fn spawn_session_actor(
     let allowed_subagent_types_for_handle = agent.definition().allowed_subagent_types.clone();
     let mut hook_discovery_errors: Vec<xai_grok_hooks::error::HookError> = Vec::new();
     let built_hook_registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>> =
-        if let Some(override_reg) = hook_registry_override {
+        if hard_budget_restricted {
+            None
+        } else if let Some(override_reg) = hook_registry_override {
             Some(override_reg)
         } else {
             let cwd_path = std::path::Path::new(&session_info.cwd);
@@ -1506,7 +1670,8 @@ pub(crate) async fn spawn_session_actor(
     let resolved_tool_overrides: std::sync::Arc<
         arc_swap::ArcSwapOption<xai_grok_sampling_types::ToolOverrides>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
-    let title_refresh_enabled = effective_config.is_title_refresh_enabled();
+    let title_refresh_enabled =
+        !hard_budget_restricted && effective_config.is_title_refresh_enabled();
     let initial_title_refresh_idx =
         crate::session::helpers::session_summary::initial_title_refresh_idx(
             title_refresh_watermark,
@@ -1734,7 +1899,7 @@ pub(crate) async fn spawn_session_actor(
         recap_epoch: std::cell::Cell::new(0),
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
-        turn_summary_enabled: effective_config.is_turn_summary_enabled(),
+        turn_summary_enabled: !hard_budget_restricted && effective_config.is_turn_summary_enabled(),
         title_refresh_enabled,
         title_refresh_task: std::cell::RefCell::new(None),
         title_refresh_generation: std::cell::Cell::new(0),

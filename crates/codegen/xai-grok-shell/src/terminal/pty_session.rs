@@ -226,6 +226,11 @@ pub(crate) async fn create_pty(
     gateway: GatewaySender,
     target_client_id: TargetClientId,
 ) -> Result<String, TerminalExtError> {
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        return Err(TerminalExtError::Internal(
+            "PTY creation is disabled while the hard-token budget is armed".into(),
+        ));
+    }
     let pty_id = uuid::Uuid::now_v7().to_string();
 
     let pty_system = native_pty_system();

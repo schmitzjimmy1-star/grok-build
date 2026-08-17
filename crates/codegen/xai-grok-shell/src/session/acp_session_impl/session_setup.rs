@@ -208,6 +208,9 @@ impl SessionActor {
     pub(crate) async fn slash_skills_for_resolve(
         &self,
     ) -> Vec<xai_grok_tools::implementations::skills::types::SkillInfo> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Vec::new();
+        }
         match slash_commands::acu_skill_source(self.is_chat_kind) {
             slash_commands::AcuSkillSource::Product => Vec::new(),
             slash_commands::AcuSkillSource::Disk => {
@@ -361,6 +364,9 @@ impl SessionActor {
     ///
     /// Skipped for BYOK users (no remote settings, no `/models-v2`).
     pub(super) async fn maybe_refresh_model_metadata_on_resume(&self) {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return;
+        }
         if !self.is_session_based_auth() {
             return;
         }

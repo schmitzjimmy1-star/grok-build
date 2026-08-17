@@ -437,7 +437,10 @@ impl SessionActor {
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
         let use_bearer_resolver = gate.active();
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
-        if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
+        if use_bearer_resolver
+            && !xai_grok_tools::util::hard_budget_environment_present()
+            && let Some(am) = self.auth_manager.as_ref()
+        {
             let _ = am.auth().await;
         }
         let api_key = if use_bearer_resolver {
@@ -936,38 +939,41 @@ impl SessionActor {
             .await
             .map(|c| (c.model, c.base_url))
             .unwrap_or_default();
-        let auth_provider =
-            if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
-                self.model_auth_provider(&failed_model_id)
-            } else {
-                None
-            };
-        let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let gate = self.auth_gate(&failed_model_id, &failed_base_url);
-            let eligible = gate.active();
-            self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
-            if !eligible && auth_provider.is_none() {
-                tracing::warn!(
-                    session_id = %self.session_info.id.0,
-                    is_session_based = gate.is_session_based,
-                    model_byok = gate.model_byok.as_str(),
-                    endpoint_is_first_party = gate.endpoint_is_first_party,
-                    "auth recovery: sampler 401 not refreshable (api-key auth) — surfacing 401",
-                );
-                xai_grok_telemetry::unified_log::warn(
-                    "auth recovery: sampler 401 not eligible (api-key auth)",
-                    Some(self.session_info.id.0.as_ref()),
-                    Some(serde_json::json!({
-                        "kind": error.kind.as_str(),
-                        "status_code": error.status_code,
-                        "is_session_based": gate.is_session_based,
-                        "model_byok": gate.model_byok.as_str(),
-                        "endpoint_is_first_party": gate.endpoint_is_first_party,
-                    })),
-                );
-            }
-            eligible
+        let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
+        let auth_provider = if !hard_budget_armed
+            && (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+        {
+            self.model_auth_provider(&failed_model_id)
+        } else {
+            None
         };
+        let auth_recovery_eligible =
+            !hard_budget_armed && matches!(error.kind, SamplingErrorKind::Auth) && {
+                let gate = self.auth_gate(&failed_model_id, &failed_base_url);
+                let eligible = gate.active();
+                self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
+                if !eligible && auth_provider.is_none() {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        is_session_based = gate.is_session_based,
+                        model_byok = gate.model_byok.as_str(),
+                        endpoint_is_first_party = gate.endpoint_is_first_party,
+                        "auth recovery: sampler 401 not refreshable (api-key auth) — surfacing 401",
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth recovery: sampler 401 not eligible (api-key auth)",
+                        Some(self.session_info.id.0.as_ref()),
+                        Some(serde_json::json!({
+                            "kind": error.kind.as_str(),
+                            "status_code": error.status_code,
+                            "is_session_based": gate.is_session_based,
+                            "model_byok": gate.model_byok.as_str(),
+                            "endpoint_is_first_party": gate.endpoint_is_first_party,
+                        })),
+                    );
+                }
+                eligible
+            };
         debug_assert!(
             !(auth_recovery_eligible && auth_provider.is_some()),
             "a provider-backed model must not be session-recovery-eligible"
@@ -1224,6 +1230,9 @@ impl SessionActor {
     /// Soft failures with a still-usable access token still return here
     /// (grace / optimistic send); 401 recovery remains the safety net.
     pub(crate) async fn refresh_token_if_expired(&self) {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return;
+        }
         if let Some(ref am) = self.auth_manager {
             let creds = self.chat_state_handle.get_credentials().await;
             let (model_id, base_url) = self

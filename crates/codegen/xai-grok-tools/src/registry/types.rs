@@ -1220,7 +1220,12 @@ impl ToolRegistryBuilder {
         let renderer_arc = Arc::new(renderer.clone());
         resources.insert(renderer);
         let (scheduler_cmd_rx, scheduler_cancel_token) =
-            if let Some(parent_handle) = ctx.parent_scheduler_handle {
+            if crate::util::hard_budget_environment_present() {
+                // Do not install a handle or spawn/restore the scheduler actor.
+                // Filtering scheduler tools is insufficient: the actor also
+                // restores persisted timers and can fire them autonomously.
+                (None, None)
+            } else if let Some(parent_handle) = ctx.parent_scheduler_handle {
                 resources.insert(parent_handle);
                 (None, None)
             } else {
