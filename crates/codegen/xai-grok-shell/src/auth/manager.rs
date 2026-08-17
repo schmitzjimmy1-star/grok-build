@@ -337,6 +337,7 @@ impl AuthManager {
                     && map
                         .get(LEGACY_SCOPE)
                         .is_some_and(|a| a.auth_mode == AuthMode::WebLogin)
+                    && !xai_grok_tools::util::hard_budget_environment_present()
                 {
                     // Best-effort cleanup under advisory lock (consistent with
                     // other auth.json writers). Non-blocking: if the lock is

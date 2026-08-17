@@ -356,6 +356,9 @@ async fn mint_provider_token(
 
     let name = &provider.name;
     let config = &provider.config;
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        anyhow::bail!("auth provider helpers are disabled while the hard-token budget is armed");
+    }
     // Clamp to [1, ceiling]: the slot lock is held across the run, so an
     // unbounded timeout would let one hung helper stall every turn sharing this
     // provider name. The ceiling is a hard bound, not just a parse warning.
@@ -527,6 +530,13 @@ impl AuthProviderRef {
         &self,
         current_key: Option<&str>,
     ) -> ProviderRefreshOutcome {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            tracing::warn!(
+                provider = %self.name,
+                "auth provider helper refused while the hard-token budget is armed"
+            );
+            return ProviderRefreshOutcome::Unusable;
+        }
         let Some(mut slot) = self.locked_slot().await else {
             return ProviderRefreshOutcome::Unusable;
         };

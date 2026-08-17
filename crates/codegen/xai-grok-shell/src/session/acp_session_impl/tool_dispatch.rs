@@ -178,6 +178,10 @@ impl SessionActor {
         command: String,
         prompt_blocks: &[acp::ContentBlock],
     ) -> PromptTurnResult {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(acp::Error::invalid_request()
+                .data("direct terminal mode is disabled while the hard-token budget is armed"));
+        }
         tracing::info!("Handling direct bash command");
 
         // Send user message chunks to scrollback (so user sees their command)

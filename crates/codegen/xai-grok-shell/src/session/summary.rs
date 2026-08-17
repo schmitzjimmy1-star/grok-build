@@ -70,6 +70,17 @@ impl SummaryGenerator {
                 // don't spawn duplicate title generation tasks.
                 self.state = State::Done;
 
+                if xai_grok_tools::util::hard_budget_environment_present() {
+                    let title =
+                        crate::session::helpers::session_summary::title_fallback_from_user_text(
+                            &content,
+                        );
+                    if let Some(tx) = self.config.persistence_tx.upgrade() {
+                        let _ = tx.send(PersistenceMsg::GeneratedTitle(title));
+                    }
+                    return;
+                }
+
                 let sampling_client = self.config.sampling_client.clone();
                 let model = self.config.model.clone();
                 let persistence_tx = self.config.persistence_tx.clone();

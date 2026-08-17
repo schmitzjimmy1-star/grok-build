@@ -9,6 +9,22 @@ use xai_grok_tools::implementations::{grok_build, opencode};
 /// Budget for the pre-completion child transcript flush (replay buffer +
 /// persistence to disk). Mirrors the workflow-shutdown persistence bound.
 const CHILD_COMPLETION_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn hard_budget_child_scope_error(
+    has_resume_source: bool,
+    has_cwd_override: bool,
+    uses_worktree_isolation: bool,
+) -> Option<&'static str> {
+    if has_resume_source {
+        Some("subagent resume is disabled while the hard-token budget is armed")
+    } else if has_cwd_override {
+        Some("subagent cwd overrides are disabled while the hard-token budget is armed")
+    } else if uses_worktree_isolation {
+        Some("subagent worktree isolation is disabled while the hard-token budget is armed")
+    } else {
+        None
+    }
+}
 pub(super) fn task_model_override_error(
     requested: Option<&str>,
     provenance: ModelOverrideProvenance,
@@ -104,6 +120,15 @@ pub(crate) async fn run_shell_child(
         &definition,
     );
     let prompt = request.prompt.clone();
+    if xai_grok_tools::util::hard_budget_environment_present()
+        && let Some(error) = hard_budget_child_scope_error(
+            request.resume_from.is_some(),
+            request.cwd.is_some(),
+            effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None,
+        )
+    {
+        return child_run_output(failure_result(&request, error), completion_data, None);
+    }
     if let Some(ref err) = effective_runtime.persona_error {
         tracing::error!(
             subagent_id = %request.id,
@@ -1583,6 +1608,19 @@ pub(crate) async fn run_shell_child(
         })),
     );
     child_run_output(result, completion_data, disposed_snapshot_ref)
+}
+
+#[cfg(test)]
+mod hard_budget_scope_tests {
+    use super::hard_budget_child_scope_error;
+
+    #[test]
+    fn armed_children_cannot_resume_change_cwd_or_create_worktrees() {
+        assert!(hard_budget_child_scope_error(true, false, false).is_some());
+        assert!(hard_budget_child_scope_error(false, true, false).is_some());
+        assert!(hard_budget_child_scope_error(false, false, true).is_some());
+        assert!(hard_budget_child_scope_error(false, false, false).is_none());
+    }
 }
 /// What the completion path did with a subagent worktree.
 pub(crate) enum Disposal {

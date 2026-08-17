@@ -407,6 +407,21 @@ impl SessionActor {
             Err(SlashCommandOutcome::Builtin(action)) => {
                 let text_block =
                     |text: String| acp::ContentBlock::Text(acp::TextContent::new(text));
+                if xai_grok_tools::util::hard_budget_environment_present()
+                    && !matches!(
+                        &action,
+                        BuiltinAction::ContextInfo | BuiltinAction::SessionInfo
+                    )
+                {
+                    self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                    self.mark_front_message_committed().await;
+                    self.send_host_turn_slash_command_output(&format!(
+                        "/{} is disabled while the GrokBuild hard-token budget is armed.",
+                        action.command_name()
+                    ))
+                    .await;
+                    return ok_end_turn(0, None);
+                }
                 let slash_used = xai_grok_telemetry::events::SlashCommandUsed {
                     command: action.command_name().to_string(),
                     args_provided: action.args_provided(),
@@ -622,33 +637,45 @@ impl SessionActor {
                 self.emit_notification_direct(notification).await;
             }
         }
+        let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
         let crate::session::prompt_parser::ParsedPrompt {
             mut context,
             query,
             skill_information: skill_info,
             images: mut raw_images,
             is_cursor,
-        } = match parse_prompt_with_skills(
-            &prompt_blocks,
-            self.tool_context.cwd.to_path_buf(),
-            &self.session_info,
-            verbatim,
-            self.is_cursor_harness(),
-            pending_skill_information.take().unwrap_or_default(),
-        )
-        .await
-        {
+        } = match if hard_budget_armed {
+            crate::session::prompt_parser::parse_hard_budget_prompt(
+                &prompt_blocks,
+                verbatim,
+                self.is_cursor_harness(),
+            )
+        } else {
+            parse_prompt_with_skills(
+                &prompt_blocks,
+                self.tool_context.cwd.to_path_buf(),
+                &self.session_info,
+                verbatim,
+                self.is_cursor_harness(),
+                pending_skill_information.take().unwrap_or_default(),
+            )
+            .await
+        } {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!("Invalid prompt: {}", err.message);
                 return Err(err);
             }
         };
-        let recovered = crate::session::placeholder_images::recover_orphan_placeholders(
-            &query,
-            &mut raw_images,
-            std::path::Path::new(&self.session_info.cwd),
-        );
+        let recovered = if hard_budget_armed {
+            0
+        } else {
+            crate::session::placeholder_images::recover_orphan_placeholders(
+                &query,
+                &mut raw_images,
+                std::path::Path::new(&self.session_info.cwd),
+            )
+        };
         if recovered > 0 {
             tracing::info!(
                 session_id = %self.session_info.id,
@@ -656,7 +683,11 @@ impl SessionActor {
                 "server-side placeholder fallback: loaded orphan image(s) from disk",
             );
         }
-        let query = crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
+        let query = if hard_budget_armed {
+            query
+        } else {
+            crate::session::placeholder_images::strip_paths_from_image_placeholders(query)
+        };
         let query = if send_now && !verbatim {
             xai_interjection_core::frame_user_turn(xai_interjection_core::INTERJECTION_NOTE, &query)
         } else {
@@ -665,7 +696,9 @@ impl SessionActor {
         let user_images = self
             .normalize_images_with_notices(&mut context, raw_images, is_cursor)
             .await;
-        let (query, extra_images) = if !self.is_cursor_harness() {
+        let (query, extra_images) = if hard_budget_armed {
+            (query, Vec::new())
+        } else if !self.is_cursor_harness() {
             let extraction = xai_grok_tools::util::base64_images::extract_base64_images(query);
             if extraction.images.is_empty() {
                 (extraction.text, Vec::new())
@@ -702,7 +735,7 @@ impl SessionActor {
             is_cursor,
         );
         let pre_truncation_text = assembled.clone();
-        let (user_message, truncated_local_path) = if verbatim {
+        let (user_message, truncated_local_path) = if hard_budget_armed || verbatim {
             (assembled, None)
         } else {
             self.maybe_truncate_large_prompt_with_skills(
@@ -768,6 +801,11 @@ impl SessionActor {
         }
         self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
+        if !user_images.is_empty() && xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(acp::Error::invalid_request().data(
+                "image and multimodal inputs are disabled while the hard-token budget is armed",
+            ));
+        }
         let user_message = if user_images.is_empty() {
             user_message
         } else if self.is_cursor_harness() {
@@ -2014,7 +2052,9 @@ impl SessionActor {
         let conv_turn_start = std::time::Instant::now();
         let conv_turn_clock = DualClock::now();
         self.maybe_refresh_model_metadata_on_resume().await;
-        self.maybe_compact_on_model_switch().await?;
+        if !xai_grok_tools::util::hard_budget_environment_present() {
+            self.maybe_compact_on_model_switch().await?;
+        }
         self.chat_state_handle
             .record_turn_start(chrono::Utc::now().timestamp_millis());
         {
@@ -2203,6 +2243,7 @@ impl SessionActor {
             }
             self.maybe_inject_mcp_reminder().await;
             if self.tool_context.task_output_token_budget.is_none()
+                && !xai_grok_tools::util::hard_budget_environment_present()
                 && self.two_pass_active()
                 && !self.compaction.prefire.has_cache()
                 && self.should_prefire_two_pass().await
@@ -2218,6 +2259,7 @@ impl SessionActor {
                 self.refresh_token_if_expired().await;
             }
             if self.tool_context.task_output_token_budget.is_none()
+                && !xai_grok_tools::util::hard_budget_environment_present()
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
                 && let Err(e) = self.run_compact_only(trigger_info).await
             {
@@ -2859,6 +2901,7 @@ impl SessionActor {
             }
             tool_turn_count = next_turn;
             if self.tool_context.task_output_token_budget.is_none()
+                && !xai_grok_tools::util::hard_budget_environment_present()
                 && let Some(trigger_info) = self.check_preflight_overflow().await
             {
                 if let Err(e) = self.run_compact_only(trigger_info).await {

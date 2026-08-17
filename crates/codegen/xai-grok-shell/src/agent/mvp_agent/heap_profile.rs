@@ -9,6 +9,9 @@ use crate::heap_profile::{SCOPED_KILL_SWITCH_INTERVAL, build_upload_handles};
 
 impl MvpAgent {
     pub(super) fn reconfigure_heap_profile_monitor(&self) {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return;
+        }
         let zdr = self.is_data_collection_disabled();
         let config = self.cfg.borrow().resolve_jemalloc_heap_profile(zdr);
         let handles = self.heap_profile_upload_handles();
@@ -51,7 +54,10 @@ impl MvpAgent {
     /// Background poll + scoped kill-switch (agent entrypoints only).
     /// Idempotent; skipped under `cfg!(test)`.
     pub(super) fn spawn_heap_profile_monitor(&self) {
-        if cfg!(test) || self.heap_profile_started.replace(true) {
+        if cfg!(test)
+            || xai_grok_tools::util::hard_budget_environment_present()
+            || self.heap_profile_started.replace(true)
+        {
             return;
         }
         self.reconfigure_heap_profile_monitor();

@@ -99,6 +99,7 @@ pub struct AgentBuilder {
         xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig,
     write_file_enabled: bool,
     subagents_enabled: bool,
+    hard_budget_tool_isolation: bool,
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
     subagent_toggle: HashMap<String, bool>,
@@ -239,6 +240,7 @@ impl AgentBuilder {
             app_builder_deployer_config: Default::default(),
             write_file_enabled: true,
             subagents_enabled: false,
+            hard_budget_tool_isolation: false,
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
             subagent_toggle: HashMap::new(),
@@ -552,6 +554,17 @@ impl AgentBuilder {
         self.subagents_enabled = enabled;
         self
     }
+    /// Restrict the model-visible tool surface to native read-only file access
+    /// and governed subagent lifecycle operations.
+    ///
+    /// This is deliberately stricter than an agent-authored allowlist: while a
+    /// hard-token campaign is armed, terminal, MCP discovery/dispatch, LSP,
+    /// hooks, workflows, schedulers, web/media, and arbitrary plugin tools must
+    /// not become alternate inference or child-process egress.
+    pub fn with_hard_budget_tool_isolation(mut self, enabled: bool) -> Self {
+        self.hard_budget_tool_isolation = enabled;
+        self
+    }
     pub fn with_background_workflows_enabled(mut self, enabled: bool) -> Self {
         self.background_workflows_enabled = enabled;
         self
@@ -670,6 +683,17 @@ impl AgentBuilder {
     /// This is the full 10-step build process from the architecture doc.
     pub async fn build(mut self) -> Result<Agent, AgentBuildError> {
         let mut definition = self.resolve_definition();
+        let hard_budget_tool_isolation = self.hard_budget_tool_isolation
+            || xai_grok_tools::util::hard_budget_environment_present();
+        if hard_budget_tool_isolation {
+            // Armed acceptance uses an immutable packet and an audited tool
+            // surface. Disk-discovered instructions/skills must not silently
+            // expand that packet or trigger plugin-backed discovery.
+            definition.agents_md = false;
+            definition.discover_skills = false;
+            definition.inherit_skills = false;
+            definition.skills.clear();
+        }
         let working_dir_str = self.working_directory.to_str().unwrap_or(".").to_string();
         let skill_info = if let Some(preloaded) = self.preloaded_skills.take() {
             preloaded
@@ -962,6 +986,9 @@ impl AgentBuilder {
         tool_config
             .tools
             .retain(|tc| definition.session_tools_allowed(&tc.id));
+        if hard_budget_tool_isolation {
+            tool_config.tools.retain(hard_budget_tool_allowed);
+        }
         {
             let mut saw_directive = false;
             let types: Vec<String> = definition
@@ -1028,7 +1055,7 @@ impl AgentBuilder {
                 }
             }
         }
-        let use_backend_search = self.backend_search;
+        let use_backend_search = self.backend_search && !hard_budget_tool_isolation;
         let web_search_enabled = self.web_search_config.is_enabled();
         let tool_bridge = ToolBridge::finalize_builder(
             tool_bridge_builder,
@@ -1082,7 +1109,7 @@ impl AgentBuilder {
         } else {
             vec![]
         };
-        {
+        if !hard_budget_tool_isolation {
             let initial_paths: Vec<PathBuf> = agents_md_files
                 .iter()
                 .map(|c| PathBuf::from(&c.file_path))
@@ -1165,7 +1192,8 @@ impl AgentBuilder {
             prompt_mode: definition.prompt_mode.clone(),
             audience: self.prompt_audience,
             prompt_body: definition.prompt_body.clone(),
-            include_browser_verification: definition.include_browser_verification(),
+            include_browser_verification: !hard_budget_tool_isolation
+                && definition.include_browser_verification(),
             system_prompt: definition.system_prompt.clone(),
             agents_md_files,
             persona_summaries: self.persona_summaries,
@@ -1222,6 +1250,29 @@ impl AgentBuilder {
             use_backend_search,
         ))
     }
+}
+
+fn hard_budget_tool_kind_allowed(kind: ToolKind) -> bool {
+    matches!(
+        kind,
+        ToolKind::Read
+            | ToolKind::Task
+            | ToolKind::BackgroundTaskAction
+            | ToolKind::WaitTasksAction
+            | ToolKind::KillTaskAction
+    )
+}
+
+fn hard_budget_tool_allowed(config: &xai_grok_tools::registry::types::ToolConfig) -> bool {
+    const ALLOWED_IDS: &[&str] = &[
+        "GrokBuild:read_file",
+        "GrokBuild:task",
+        "GrokBuild:get_task_output",
+        "GrokBuild:wait_tasks",
+        "GrokBuild:kill_task",
+    ];
+    ALLOWED_IDS.contains(&config.id.as_str())
+        && config.kind.is_some_and(hard_budget_tool_kind_allowed)
 }
 /// CLI naming for the shared [`xai_tool_types::build_task_description`] builder.
 const TASK_TOOL_NAMING: xai_tool_types::TaskToolNaming<'static> = xai_tool_types::TaskToolNaming {
@@ -1346,6 +1397,44 @@ fn resolve_shell_for_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_budget_tool_isolation_is_a_strict_read_and_subagent_allowlist() {
+        for allowed in [
+            ToolKind::Read,
+            ToolKind::Task,
+            ToolKind::BackgroundTaskAction,
+            ToolKind::WaitTasksAction,
+            ToolKind::KillTaskAction,
+        ] {
+            assert!(hard_budget_tool_kind_allowed(allowed));
+        }
+        for denied in [
+            ToolKind::Execute,
+            ToolKind::Edit,
+            ToolKind::Write,
+            ToolKind::ListDir,
+            ToolKind::Search,
+            ToolKind::Lsp,
+            ToolKind::WebSearch,
+            ToolKind::WebFetch,
+            ToolKind::UseTool,
+            ToolKind::Workflow,
+            ToolKind::Other,
+        ] {
+            assert!(!hard_budget_tool_kind_allowed(denied));
+        }
+        let read: xai_grok_tools::registry::types::ToolConfig =
+            (&xai_grok_tools::implementations::grok_build::ReadFileTool).into();
+        assert!(hard_budget_tool_allowed(&read));
+        let terminal: xai_grok_tools::registry::types::ToolConfig =
+            (&xai_grok_tools::implementations::grok_build::BashTool).into();
+        assert!(!hard_budget_tool_allowed(&terminal));
+        let mut hostile_read = read.clone();
+        hostile_read.id = "Plugin:network_disguised_as_read".to_string();
+        hostile_read.kind = Some(ToolKind::Read);
+        assert!(!hard_budget_tool_allowed(&hostile_read));
+    }
     use crate::config::AgentScope;
     fn entry(name: &str, desc: &str, source: SubagentSource) -> SubagentEntry {
         SubagentEntry {

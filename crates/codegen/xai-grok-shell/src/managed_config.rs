@@ -1016,6 +1016,19 @@ pub fn managed_policy_gate() -> Result<(), String> {
     )
 }
 
+/// Read-only form of the managed-policy gate for the armed hard-budget stdio
+/// process. It preserves the fail-closed policy decision without purging files,
+/// advancing rollback markers, taking mutation locks, or attempting repair.
+pub fn managed_policy_gate_read_only() -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    managed_policy_gate_decision(
+        managed_principal_present(),
+        crate::config::managed_policy_compromised_for(&current_serving_identity_any_expiry()),
+    )
+}
+
 /// Purge prior team (A) artifacts on a confirmed offline team switch so the gate admits
 /// team B. Detector is marker-scoped ([`crate::config::confirmed_team_switch`]): key-scoped
 /// markers never purge here; config.toml blips are not switches. Under the managed-config

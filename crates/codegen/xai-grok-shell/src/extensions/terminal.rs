@@ -8,6 +8,17 @@ use std::collections::HashMap;
 
 type ExtResult = Result<acp::ExtResponse, acp::Error>;
 
+fn hard_budget_allows_terminal_method(method: &str) -> bool {
+    matches!(
+        method,
+        "x.ai/terminal/kill"
+            | "x.ai/terminal/output"
+            | "x.ai/terminal/wait_for_exit"
+            | "x.ai/terminal/release"
+            | "x.ai/terminal/list"
+    )
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvVar {
@@ -183,6 +194,13 @@ impl From<KillOutcome> for KillOutcomeResponse {
 }
 
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    if xai_grok_tools::util::hard_budget_environment_present()
+        && !hard_budget_allows_terminal_method(args.method.as_ref())
+    {
+        return Err(acp::Error::invalid_request().data(
+            "terminal creation and input are disabled while the hard-token budget is armed",
+        ));
+    }
     match args.method.as_ref() {
         "x.ai/terminal/create" => {
             let req: CreateTerminalRequest = parse(args)?;
@@ -349,6 +367,10 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 }
 
 pub(crate) async fn handle_pty_input(params: &serde_json::Value) {
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        tracing::warn!("ignored PTY input while the hard-token budget is armed");
+        return;
+    }
     use base64::Engine as _;
 
     let Ok(input) = serde_json::from_value::<PtyInputNotification>(params.clone()) else {
@@ -362,5 +384,33 @@ pub(crate) async fn handle_pty_input(params: &serde_json::Value) {
 
     if let Err(e) = terminal::pty_session::write_pty_input(&input.terminal_id, &bytes).await {
         tracing::warn!("pty input write failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod hard_budget_tests {
+    use super::hard_budget_allows_terminal_method;
+
+    #[test]
+    fn armed_terminal_surface_is_cleanup_only() {
+        for method in [
+            "x.ai/terminal/create",
+            "x.ai/terminal/background",
+            "x.ai/terminal/pty/create",
+            "x.ai/terminal/pty/load",
+            "x.ai/terminal/pty/resize",
+            "x.ai/terminal/pty/input",
+        ] {
+            assert!(!hard_budget_allows_terminal_method(method), "{method}");
+        }
+        for method in [
+            "x.ai/terminal/kill",
+            "x.ai/terminal/output",
+            "x.ai/terminal/wait_for_exit",
+            "x.ai/terminal/release",
+            "x.ai/terminal/list",
+        ] {
+            assert!(hard_budget_allows_terminal_method(method), "{method}");
+        }
     }
 }

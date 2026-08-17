@@ -412,6 +412,9 @@ impl MvpAgent {
         client_servers: Vec<acp::McpServer>,
         cwd: &std::path::Path,
     ) -> (Vec<acp::McpServer>, Vec<acp::McpServer>) {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return (Vec::new(), Vec::new());
+        }
         self.ensure_plugin_registry();
         let compat = self.cfg.borrow().compat_resolved;
         let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
@@ -556,6 +559,9 @@ impl MvpAgent {
     pub(super) fn build_registry_config(
         &self,
     ) -> Option<crate::session::RegistryConfig> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return None;
+        }
         let remote = self
             .cfg
             .borrow()
@@ -597,6 +603,9 @@ impl MvpAgent {
     pub(crate) fn conversations_client(
         &self,
     ) -> Option<crate::remote::ConversationsClient> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return None;
+        }
         if !crate::session::unified_list::conversations_lane_active() {
             return None;
         }
@@ -699,6 +708,11 @@ impl MvpAgent {
         ) else {
             return Ok(None);
         };
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(acp::Error::invalid_request().data(
+                "owned local workspaces are disabled while the hard-token budget is armed",
+            ));
+        }
         let cwd = if cwd.as_os_str().is_empty() {
             session_cwd.to_path_buf()
         } else {
@@ -2366,8 +2380,15 @@ impl MvpAgent {
                     byok_from_models(&models, None, current.0.as_ref()),
                 );
         }
-        crate::upload::trace::spawn_purge_stale_upload_scratch();
-        let storage_mode = cfg.storage_mode;
+        let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
+        if !hard_budget_armed {
+            crate::upload::trace::spawn_purge_stale_upload_scratch();
+        }
+        let storage_mode = if hard_budget_armed {
+            crate::config::StorageMode::Local
+        } else {
+            cfg.storage_mode
+        };
         let default_yolo_mode = cfg.default_yolo_mode;
         let default_auto_mode = cfg.default_auto_mode;
         let tui_mode = cfg.mode == crate::agent::config::AgentMode::Tui;
@@ -2375,7 +2396,8 @@ impl MvpAgent {
         let has_xai_auth = auth_manager
             .current_or_expired()
             .is_some_and(|a| a.is_xai_auth());
-        let relay_sync_enabled = tui_mode && relay_config_enabled && has_xai_auth;
+        let relay_sync_enabled =
+            !hard_budget_armed && tui_mode && relay_config_enabled && has_xai_auth;
         let config_root = crate::config::load_effective_config().ok();
         let empty_config = toml::Value::Table(toml::map::Map::new());
         let raw = config_root.as_ref().unwrap_or(&empty_config);
@@ -2383,13 +2405,13 @@ impl MvpAgent {
             raw,
             cfg.remote_settings.as_ref(),
         );
-        let restore_code = crate::util::config::resolve_restore_code(
-            raw,
-            cfg.remote_settings.as_ref(),
-        );
-        let session_registry_local = crate::util::config::session_registry_local_override(
-            config_root.as_ref(),
-        );
+        let restore_code = !hard_budget_armed
+            && crate::util::config::resolve_restore_code(raw, cfg.remote_settings.as_ref());
+        let session_registry_local = if hard_budget_armed {
+            Some(false)
+        } else {
+            crate::util::config::session_registry_local_override(config_root.as_ref())
+        };
         tracing::info!(
             worktree_type = ?worktree_type,
             source = wt_source,
@@ -2418,6 +2440,7 @@ impl MvpAgent {
             session_registry: SessionRegistry::default(),
             resident_roster_titles: RefCell::new(HashMap::new()),
             initialize_request: OnceLock::new(),
+            hard_budget_prompt_claimed: std::cell::Cell::new(false),
             gateway,
             launch_cwd: std::env::current_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -2432,7 +2455,9 @@ impl MvpAgent {
                 let chat_modes = crate::agent::chat_modes::ChatModesManager::new(
                     auth_manager.clone(),
                 );
-                if crate::agent::chat_modes::process_chat_mode_enabled() {
+                if !hard_budget_armed
+                    && crate::agent::chat_modes::process_chat_mode_enabled()
+                {
                     chat_modes.warm_in_background();
                 }
                 chat_modes
@@ -2454,9 +2479,9 @@ impl MvpAgent {
             otel_gate: crate::agent::otel_gate::OtelGate::default(),
             default_yolo_mode,
             default_auto_mode,
-            trace_upload_live: Arc::new(
-                std::sync::atomic::AtomicBool::new(cfg.is_trace_upload_enabled()),
-            ),
+            trace_upload_live: Arc::new(std::sync::atomic::AtomicBool::new(
+                !hard_budget_armed && cfg.is_trace_upload_enabled(),
+            )),
             memory_config: None,
             config_watcher_path_tx: None,
             relay_sync_enabled,
@@ -2521,17 +2546,17 @@ impl MvpAgent {
             #[cfg(test)]
             post_auth_settings_spawn_count: std::cell::Cell::new(0),
         };
-        instance
-            .auth_manager
-            .configure_refresher(
+        if !hard_budget_armed {
+            instance.auth_manager.configure_refresher(
                 instance.cfg.borrow().grok_com_config.auth_provider_command.clone(),
                 instance.diagnostic_upload_config(),
             );
-        crate::auth::credential_provider::wire_otel_auth_manager(
-            instance.auth_manager.clone(),
-        );
-        if let Some(ref dk) = instance.cfg.borrow().endpoints.deployment_key {
-            crate::auth::credential_provider::wire_otel_deployment_key(dk.clone());
+            crate::auth::credential_provider::wire_otel_auth_manager(
+                instance.auth_manager.clone(),
+            );
+            if let Some(ref dk) = instance.cfg.borrow().endpoints.deployment_key {
+                crate::auth::credential_provider::wire_otel_deployment_key(dk.clone());
+            }
         }
         instance
     }
@@ -3160,13 +3185,17 @@ impl MvpAgent {
     pub(crate) async fn trace_upload_config(
         &self,
     ) -> Option<crate::session::repo_changes::UploadMethod> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return None;
+        }
         let (method, _reason) = self.trace_upload_config_with_reason().await;
         method
     }
     pub(super) fn trace_upload_config_snapshot(
         &self,
     ) -> Option<crate::session::repo_changes::UploadMethod> {
-        if self.is_data_collection_disabled()
+        if xai_grok_tools::util::hard_budget_environment_present()
+            || self.is_data_collection_disabled()
             || !self.cfg.borrow().is_trace_upload_enabled()
         {
             return None;
@@ -3241,6 +3270,9 @@ impl MvpAgent {
         crate::upload::turn::TraceUploadReason,
     ) {
         use crate::upload::turn::TraceUploadReason;
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return (None, TraceUploadReason::FeatureOff);
+        }
         if self.is_data_collection_disabled() {
             crate::upload::trace::spawn_startup_spill_reconcile(
                 crate::util::grok_home::grok_home(),
@@ -3966,13 +3998,17 @@ impl MvpAgent {
             spawn_remote_settings.as_ref(),
             false,
         );
-        let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
-        let project_env_trusted = folder_trust::project_scope_allowed(cwd.as_path());
-        let envrc = envrc
-            .unwrap_or_else(|| xai_grok_workspace::envrc::spawn_envrc_load(
+        let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
+        let load_envrc = !hard_budget_armed
+            && self.cfg.borrow().session.load_envrc.unwrap_or(true);
+        let project_env_trusted = !hard_budget_armed
+            && folder_trust::project_scope_allowed(cwd.as_path());
+        let envrc = envrc.unwrap_or_else(|| {
+            xai_grok_workspace::envrc::spawn_envrc_load(
                 cwd.as_path().to_path_buf(),
                 load_envrc && project_env_trusted,
-            ));
+            )
+        });
         let use_acp_fs = client_fs_read && client_fs_write;
         let fs_notify_config = init
             .client_capabilities
@@ -4216,7 +4252,8 @@ impl MvpAgent {
             .borrow()
             .is_feature_enabled(crate::agent::config::Feature::CompactionVerbatimInput);
         let compaction_tool_choice = self.cfg.borrow().resolve_compaction_tool_choice();
-        let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
+        let two_pass_enabled = !xai_grok_tools::util::hard_budget_environment_present()
+            && self.cfg.borrow().is_two_pass_compaction_enabled();
         let auto_update = self.cfg.borrow().cli.auto_update;
         let client_type = *self.client_type.borrow();
         let buffering_settings = self.buffering_settings.borrow().clone();
@@ -4336,7 +4373,10 @@ impl MvpAgent {
             .cfg
             .borrow()
             .is_feature_enabled(crate::agent::config::Feature::LspTools);
-        if lsp_tools_enabled && tool_ctx.lsp.is_none() {
+        if lsp_tools_enabled
+            && tool_ctx.lsp.is_none()
+            && !xai_grok_tools::util::hard_budget_environment_present()
+        {
             let snapshot = self.plugin_registry_handle.snapshot();
             let active: Vec<_> = snapshot
                 .iter()
@@ -4595,12 +4635,18 @@ impl MvpAgent {
                 .and_then(|m| m.get("x.ai/gitHeadChanged"))
                 .and_then(|v| v.as_bool());
             let session_cwd = std::path::Path::new(&session_info.cwd);
-            let fs_watch_caps = crate::session::fs_watch::FsWatchCapabilities::resolve(crate::session::fs_watch::CapabilityInputs {
-                client_notify: fs_notify_config.is_some(),
-                hunk_tracking: hunk_plan.enabled(),
-                code_nav: client_code_nav_enabled,
-                git_head_changed,
-            });
+            let fs_watch_caps = if hard_budget_armed {
+                crate::session::fs_watch::FsWatchCapabilities::none()
+            } else {
+                crate::session::fs_watch::FsWatchCapabilities::resolve(
+                    crate::session::fs_watch::CapabilityInputs {
+                        client_notify: fs_notify_config.is_some(),
+                        hunk_tracking: hunk_plan.enabled(),
+                        code_nav: client_code_nav_enabled,
+                        git_head_changed,
+                    },
+                )
+            };
             tool_ctx.live_orphan_heal_lock = self
                 .session_registry
                 .live_orphan_heal_lock(&session_info.id);
@@ -4813,7 +4859,9 @@ impl MvpAgent {
         {
             scope.kill_all();
         }
-        self.spawn_managed_gateway_tool_catalog_fetch();
+        if !xai_grok_tools::util::hard_budget_environment_present() {
+            self.spawn_managed_gateway_tool_catalog_fetch();
+        }
         let cwd_for_maintenance = session_info.cwd.clone();
         tokio::spawn(async move {
             crate::session::prompt_history::truncate_if_needed_async(cwd_for_maintenance)

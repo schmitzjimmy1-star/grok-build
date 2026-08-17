@@ -135,6 +135,10 @@ pub(crate) struct AgentRebuildSpec {
     /// onto [`SessionHandle::scheduler_background_loops`](crate::session::SessionHandle),
     /// which is what clients read — keep the two on one resolve.
     pub scheduler_background_loops: bool,
+    /// Process-authoritative acceptance isolation. This is re-applied on every
+    /// model switch and subagent rebuild so no alternate builder path can
+    /// restore terminal, MCP-like, workflow, or plugin tools.
+    pub hard_budget_tool_isolation: bool,
     pub mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,
     pub managed_gateway_tool_client:
         Option<xai_grok_tools::types::resources::ManagedGatewayToolClient>,
@@ -235,6 +239,7 @@ impl AgentRebuildSpec {
             respect_gitignore,
             path_not_found_hints,
             scheduler_background_loops,
+            hard_budget_tool_isolation,
             mcp_state,
             managed_gateway_tool_client,
             is_non_interactive,
@@ -281,6 +286,7 @@ impl AgentRebuildSpec {
         .with_write_file_enabled(*write_file_enabled)
         .with_fs(fs_backend.clone())
         .with_subagents_enabled(*subagents_enabled)
+        .with_hard_budget_tool_isolation(*hard_budget_tool_isolation)
         .with_subagent_toggle(subagent_toggle.clone())
         .with_background_workflows_enabled(*background_workflows_enabled)
         .with_task_model_slugs(
@@ -449,6 +455,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits::default(),
         write_file_enabled: true,
         subagents_enabled: false,
+        hard_budget_tool_isolation: false,
         subagent_toggle: HashMap::new(),
         background_workflows_enabled: false,
         ask_user_question_enabled: true,

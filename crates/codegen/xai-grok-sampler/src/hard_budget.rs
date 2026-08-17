@@ -45,7 +45,7 @@ pub enum HardTokenBudgetError {
     AllocationUnavailable,
     #[error("hard-token-budget allocation call ceiling is exhausted")]
     CallCeilingExhausted,
-    #[error("hard-token-budget request identity is invalid or duplicated")]
+    #[error("hard-token-budget provider request identity is invalid")]
     InvalidRequestIdentity,
     #[error("hard-token-budget route contract is invalid")]
     InvalidRouteContract,
@@ -395,13 +395,6 @@ impl HardTokenBudget {
         self.with_locked_state(|state| {
             if state.violated {
                 return Err(HardTokenBudgetError::Violated);
-            }
-            if state
-                .reservations
-                .iter()
-                .any(|record| record.request_id == request_id)
-            {
-                return Err(HardTokenBudgetError::InvalidRequestIdentity);
             }
             let outstanding = outstanding_tokens(state)?;
             let charged = state
@@ -1102,6 +1095,59 @@ mod tests {
         assert_eq!(status.remaining_tokens, 800);
         assert_eq!(status.allocation_remaining_tokens, Some(300));
         assert_eq!(status.allocation_remaining_calls, Some(1));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_provider_turn_id_gets_unique_reservations_for_tool_loop_calls() {
+        let dir = private_dir("same-turn-tool-loop");
+        let mut contract = allocation("a", "model-a", 300);
+        contract.token_ceiling = 600;
+        contract.max_model_calls = 2;
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "same-turn-tool-loop".into(),
+            600,
+            "d".repeat(64),
+            contract,
+        )
+        .unwrap();
+
+        let first = budget
+            .reserve_authorized_request(
+                "same-acp-turn-id",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap();
+        let second = budget
+            .reserve_authorized_request(
+                "same-acp-turn-id",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.sequence, second.sequence);
+        first.settle(50).unwrap();
+        second.settle(50).unwrap();
+        assert!(matches!(
+            budget.reserve_authorized_request(
+                "same-acp-turn-id",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            ),
+            Err(HardTokenBudgetError::CallCeilingExhausted)
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
 

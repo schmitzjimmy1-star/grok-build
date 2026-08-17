@@ -747,6 +747,11 @@ pub struct MvpAgent {
     /// of emitting empty ones — `resident_roster_entry` can't read disk.
     resident_roster_titles: RefCell<RosterDisplayCache>,
     pub(crate) initialize_request: OnceLock<acp::InitializeRequest>,
+    /// One governed process owns exactly one immutable packet allocation and
+    /// therefore accepts exactly one ACP user prompt. Tool-loop follow-up
+    /// samples remain inside that prompt and are charged as separate sampler
+    /// reservations.
+    hard_budget_prompt_claimed: std::cell::Cell<bool>,
     pub(crate) gateway: GatewaySender,
     /// Agent configuration. LEADER-SAFE(init-once): never mutated after construction.
     pub(crate) cfg: RefCell<AgentConfig>,
