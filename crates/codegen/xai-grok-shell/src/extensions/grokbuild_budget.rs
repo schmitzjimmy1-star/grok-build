@@ -10,8 +10,9 @@ use serde::Serialize;
 use super::{ExtResult, to_raw_response};
 
 pub const METHOD: &str = "com.grokbuild/budget/status";
+pub const RECEIPTS_METHOD: &str = "com.grokbuild/budget/receipts";
 pub const CAPABILITY_KEY: &str = "com.grokbuild/hardTokenBudget";
-pub const CAPABILITY_VERSION: u32 = 1;
+pub const CAPABILITY_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +25,7 @@ struct BudgetCapability {
     bound_method_version: u32,
     durable: bool,
     process_shared: bool,
+    receipt_projection: bool,
     cancel_conservative: bool,
     crash_conservative: bool,
     no_automatic_retry: bool,
@@ -71,6 +73,7 @@ fn capability() -> BudgetCapability {
         bound_method_version: 1,
         durable: true,
         process_shared: true,
+        receipt_projection: armed,
         cancel_conservative: true,
         crash_conservative: true,
         // Retained for schema compatibility. The fork proves sampler transport
@@ -131,10 +134,41 @@ fn capability() -> BudgetCapability {
 
 #[tracing::instrument(skip_all, fields(method = %args.method))]
 pub async fn handle(args: &acp::ExtRequest) -> ExtResult {
-    if args.method.as_ref() != METHOD {
-        return Err(acp::Error::method_not_found());
+    match args.method.as_ref() {
+        METHOD => to_raw_response(&capability()),
+        RECEIPTS_METHOD => {
+            let query: xai_grok_sampler::HardTokenReceiptQuery =
+                serde_json::from_str(args.params.get()).map_err(|_| {
+                    acp::Error::invalid_params().data(
+                    "receipt query must bind campaign, manifest, allocation, packet, and baseline",
+                )
+                })?;
+            let budget = xai_grok_sampler::HardTokenBudget::from_env()
+                .map_err(|_| {
+                    acp::Error::invalid_request().data("hard-token budget is unavailable")
+                })?
+                .ok_or_else(|| {
+                    acp::Error::invalid_request().data("hard-token budget is not armed")
+                })?;
+            let snapshot = budget.receipts(&query).map_err(|error| match error {
+                xai_grok_sampler::HardTokenBudgetError::ReceiptContractMismatch => {
+                    acp::Error::invalid_request().data(
+                        "receipt query does not match the immutable hard-token budget contract",
+                    )
+                }
+                xai_grok_sampler::HardTokenBudgetError::ReceiptBaselineInvalid => {
+                    acp::Error::invalid_request().data(
+                        "receipt baseline is invalid for the current hard-token budget ledger",
+                    )
+                }
+                _ => {
+                    acp::Error::invalid_request().data("hard-token budget receipts are unavailable")
+                }
+            })?;
+            to_raw_response(&snapshot)
+        }
+        _ => Err(acp::Error::method_not_found()),
     }
-    to_raw_response(&capability())
 }
 
 #[cfg(test)]
@@ -145,7 +179,7 @@ mod tests {
     fn capability_is_honestly_namespaced_and_unarmed_by_default() {
         let value = capability_value();
         assert_eq!(CAPABILITY_KEY, "com.grokbuild/hardTokenBudget");
-        assert_eq!(value["capabilityVersion"], 1);
+        assert_eq!(value["capabilityVersion"], 2);
         assert_eq!(value["armed"], false);
         assert_eq!(value["enforcementPoint"], "sampler-pre-dispatch");
         assert_eq!(value["noAutomaticRetry"], false);

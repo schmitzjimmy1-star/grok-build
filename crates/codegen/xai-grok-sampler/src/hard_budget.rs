@@ -67,6 +67,10 @@ pub enum HardTokenBudgetError {
     ReservationMissing,
     #[error("hard-token-budget reservation is already settled")]
     AlreadySettled,
+    #[error("hard-token-budget receipt query does not match this immutable contract")]
+    ReceiptContractMismatch,
+    #[error("hard-token-budget receipt baseline is invalid for the current ledger")]
+    ReceiptBaselineInvalid,
     #[error("hard-token-budget arithmetic overflow")]
     Overflow,
     #[error("hard-token-budget enforcement is unsupported on this platform")]
@@ -140,12 +144,69 @@ pub struct HardTokenBudgetStatus {
     pub allocation_remaining_calls: Option<u64>,
 }
 
+/// A caller-supplied cursor is accepted only for the immutable contract this
+/// process has already loaded. It is an observation cursor, never a file or
+/// campaign selector.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct HardTokenReceiptQuery {
+    pub campaign_id: String,
+    pub manifest_sha256: String,
+    pub allocation_id: String,
+    pub packet_id: String,
+    pub baseline_sequence: u64,
+    pub baseline_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardTokenReservationReceipt {
+    pub reservation_id: String,
+    pub sequence: u64,
+    pub provider_request_id: String,
+    pub model: String,
+    pub endpoint_sha256: String,
+    pub api_backend: String,
+    pub payload_bytes: u64,
+    pub max_output_tokens: u64,
+    pub reserved_tokens: u64,
+    /// Provider usage is deliberately absent until a complete terminal usage
+    /// packet has been observed. A missing value is charged conservatively.
+    pub actual_tokens: Option<u64>,
+    pub charged_tokens: u64,
+    pub terminal_state: HardTokenReceiptTerminalState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardTokenReceiptTerminalState {
+    /// The provider dispatch still owns this reservation. It remains fully
+    /// charged for admission purposes, but is not a terminal outcome.
+    Reserved,
+    SettledUsageReported,
+    AmbiguousFullReservationCharged,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardTokenReceiptSnapshot {
+    pub campaign_id: String,
+    pub manifest_sha256: String,
+    pub allocation_id: String,
+    pub packet_id: String,
+    pub ledger_revision: u64,
+    pub next_sequence: u64,
+    pub receipts: Vec<HardTokenReservationReceipt>,
+}
+
 #[derive(Debug)]
 pub struct BudgetReservation {
     budget: HardTokenBudget,
     id: String,
     pub sequence: u64,
     pub reserved_tokens: u64,
+    active: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -156,6 +217,8 @@ struct LedgerState {
     ceiling_tokens: u64,
     manifest_sha256: String,
     next_sequence: u64,
+    #[serde(default)]
+    revision: u64,
     settled_tokens: u64,
     #[serde(default)]
     violated: bool,
@@ -168,6 +231,8 @@ struct LedgerState {
 struct ReservationRecord {
     id: String,
     sequence: u64,
+    #[serde(default)]
+    last_updated_revision: u64,
     request_id: String,
     allocation_id: Option<String>,
     packet_id: Option<String>,
@@ -178,6 +243,62 @@ struct ReservationRecord {
     max_output_tokens: Option<u64>,
     reserved_tokens: u64,
     actual_tokens: Option<u64>,
+    /// Older ledgers predate lifecycle evidence. Their in-flight/terminal
+    /// distinction is unknowable after restart, so serde defaults them to the
+    /// conservative terminal state rather than claiming a live dispatch.
+    #[serde(default)]
+    lifecycle: ReservationLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReservationLifecycle {
+    Reserved,
+    SettledUsageReported,
+    TerminalAmbiguous,
+}
+
+impl Default for ReservationLifecycle {
+    fn default() -> Self {
+        Self::TerminalAmbiguous
+    }
+}
+
+impl HardTokenReservationReceipt {
+    fn from_record(record: &ReservationRecord) -> Self {
+        let (charged_tokens, terminal_state) = match record.lifecycle {
+            ReservationLifecycle::Reserved => (
+                record.reserved_tokens,
+                HardTokenReceiptTerminalState::Reserved,
+            ),
+            ReservationLifecycle::SettledUsageReported => (
+                record.actual_tokens.unwrap_or(record.reserved_tokens),
+                HardTokenReceiptTerminalState::SettledUsageReported,
+            ),
+            ReservationLifecycle::TerminalAmbiguous => (
+                record.reserved_tokens,
+                HardTokenReceiptTerminalState::AmbiguousFullReservationCharged,
+            ),
+        };
+        // Records without these fields originate only from the non-contract
+        // test helper. They can never be projected because `receipts` requires
+        // a loaded allocation, so defaults here cannot turn an unknown route
+        // into a claim about a governed provider dispatch.
+        Self {
+            reservation_id: record.id.clone(),
+            sequence: record.sequence,
+            provider_request_id: record.request_id.clone(),
+            model: record.model.clone(),
+            endpoint_sha256: record.endpoint_sha256.clone().unwrap_or_default(),
+            api_backend: record.api_backend.clone().unwrap_or_default(),
+            payload_bytes: record.payload_bytes.unwrap_or_default(),
+            max_output_tokens: record.max_output_tokens.unwrap_or_default(),
+            reserved_tokens: record.reserved_tokens,
+            actual_tokens: record.actual_tokens,
+            charged_tokens,
+            terminal_state,
+        }
+    }
 }
 
 impl HardTokenBudget {
@@ -426,9 +547,14 @@ impl HardTokenBudget {
                 .next_sequence
                 .checked_add(1)
                 .ok_or(HardTokenBudgetError::Overflow)?;
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(HardTokenBudgetError::Overflow)?;
             state.reservations.push(ReservationRecord {
                 id: reservation_id.clone(),
                 sequence,
+                last_updated_revision: state.revision,
                 request_id: request_id.to_string(),
                 allocation_id: allocation.map(|value| value.id.clone()),
                 packet_id: allocation.map(|value| value.packet_id.clone()),
@@ -439,6 +565,7 @@ impl HardTokenBudget {
                 max_output_tokens,
                 reserved_tokens,
                 actual_tokens: None,
+                lifecycle: ReservationLifecycle::Reserved,
             });
             Ok(())
         })?;
@@ -447,6 +574,7 @@ impl HardTokenBudget {
             id: reservation_id,
             sequence,
             reserved_tokens,
+            active: true,
         })
     }
 
@@ -497,6 +625,63 @@ impl HardTokenBudget {
         )))
     }
 
+    /// Project durable reservation evidence for only this process's loaded
+    /// campaign manifest and packet allocation. This never accepts a path,
+    /// exposes prompt text, or exposes credential material.
+    pub fn receipts(
+        &self,
+        query: &HardTokenReceiptQuery,
+    ) -> Result<HardTokenReceiptSnapshot, HardTokenBudgetError> {
+        let allocation = self
+            .inner
+            .allocation
+            .as_ref()
+            .ok_or(HardTokenBudgetError::RouteContractRequired)?;
+        if query.campaign_id != self.inner.campaign_id
+            || query.manifest_sha256 != self.inner.manifest_sha256
+            || query.allocation_id != allocation.id
+            || query.packet_id != allocation.packet_id
+        {
+            return Err(HardTokenBudgetError::ReceiptContractMismatch);
+        }
+        let mut result = None;
+        self.with_locked_read_state(|state| {
+            // `next_sequence` is the snapshot's exclusive high-water cursor:
+            // a later reservation is assigned exactly this value. Accepting it
+            // makes a snapshot directly reusable, while `>=` below ensures
+            // that later reservation is not skipped.
+            if query.baseline_sequence > state.next_sequence
+                || query.baseline_revision > state.revision
+            {
+                return Err(HardTokenBudgetError::ReceiptBaselineInvalid);
+            }
+            let receipts = state
+                .reservations
+                .iter()
+                .filter(|record| {
+                    record.allocation_id.as_deref() == Some(allocation.id.as_str())
+                        && record.packet_id.as_deref() == Some(allocation.packet_id.as_str())
+                        && (record.sequence >= query.baseline_sequence
+                            || record.last_updated_revision > query.baseline_revision)
+                })
+                .map(HardTokenReservationReceipt::from_record)
+                .collect();
+            result = Some(HardTokenReceiptSnapshot {
+                campaign_id: state.campaign_id.clone(),
+                manifest_sha256: state.manifest_sha256.clone(),
+                allocation_id: allocation.id.clone(),
+                packet_id: allocation.packet_id.clone(),
+                ledger_revision: state.revision,
+                next_sequence: state.next_sequence,
+                receipts,
+            });
+            Ok(())
+        })?;
+        result.ok_or(HardTokenBudgetError::Malformed(serde_json::Error::io(
+            std::io::Error::other("missing receipts"),
+        )))
+    }
+
     fn settle(&self, id: &str, actual_tokens: u64) -> Result<(), HardTokenBudgetError> {
         self.with_locked_state(|state| {
             let record = state
@@ -508,6 +693,12 @@ impl HardTokenBudget {
                 return Err(HardTokenBudgetError::AlreadySettled);
             }
             record.actual_tokens = Some(actual_tokens);
+            record.lifecycle = ReservationLifecycle::SettledUsageReported;
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(HardTokenBudgetError::Overflow)?;
+            record.last_updated_revision = state.revision;
             if actual_tokens > record.reserved_tokens {
                 state.violated = true;
             }
@@ -515,6 +706,32 @@ impl HardTokenBudget {
                 .settled_tokens
                 .checked_add(actual_tokens)
                 .ok_or(HardTokenBudgetError::Overflow)?;
+            Ok(())
+        })
+    }
+
+    /// Once a reservation-owning stream/request disappears without a complete
+    /// provider usage packet, durably record that terminal ambiguity. The
+    /// accounting was already fail-closed at the full reservation; this only
+    /// makes its lifecycle truthful to receipt consumers.
+    fn mark_ambiguous(&self, id: &str) -> Result<(), HardTokenBudgetError> {
+        self.with_locked_state(|state| {
+            let record = state
+                .reservations
+                .iter_mut()
+                .find(|record| record.id == id)
+                .ok_or(HardTokenBudgetError::ReservationMissing)?;
+            if record.actual_tokens.is_some()
+                || record.lifecycle == ReservationLifecycle::TerminalAmbiguous
+            {
+                return Ok(());
+            }
+            record.lifecycle = ReservationLifecycle::TerminalAmbiguous;
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(HardTokenBudgetError::Overflow)?;
+            record.last_updated_revision = state.revision;
             Ok(())
         })
     }
@@ -530,6 +747,21 @@ impl HardTokenBudget {
         self.persist_state(&state)?;
         FileExt::unlock(&lock)?;
         Ok(result)
+    }
+
+    /// Execute an observational ledger read under the same cross-process lock
+    /// as mutation, but never rewrite the ledger as a side effect of asking
+    /// for receipts.
+    fn with_locked_read_state<T>(
+        &self,
+        operation: impl FnOnce(&LedgerState) -> Result<T, HardTokenBudgetError>,
+    ) -> Result<T, HardTokenBudgetError> {
+        let lock = open_private_file(&self.inner.lock_path, true)?;
+        lock.lock_exclusive()?;
+        let state = self.read_or_initialize_state()?;
+        let result = operation(&state);
+        FileExt::unlock(&lock)?;
+        result
     }
 
     fn read_or_initialize_state(&self) -> Result<LedgerState, HardTokenBudgetError> {
@@ -556,6 +788,7 @@ impl HardTokenBudget {
                     ceiling_tokens: self.inner.ceiling_tokens,
                     manifest_sha256: self.inner.manifest_sha256.clone(),
                     next_sequence: 1,
+                    revision: 0,
                     settled_tokens: 0,
                     violated: false,
                     reservations: Vec::new(),
@@ -603,8 +836,21 @@ impl HardTokenBudget {
 impl BudgetReservation {
     /// Release only the provably unused remainder. If this is never called the
     /// durable ledger keeps the complete reservation charged.
-    pub fn settle(self, actual_tokens: u64) -> Result<(), HardTokenBudgetError> {
-        self.budget.settle(&self.id, actual_tokens)
+    pub fn settle(mut self, actual_tokens: u64) -> Result<(), HardTokenBudgetError> {
+        self.budget.settle(&self.id, actual_tokens)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        if self.active {
+            // Drop cannot surface an I/O error. Leaving the reservation in its
+            // durable `reserved` state still charges it in full, so a failed
+            // lifecycle transition cannot weaken crash accounting.
+            let _ = self.budget.mark_ambiguous(&self.id);
+        }
     }
 }
 
@@ -828,6 +1074,18 @@ mod tests {
             token_ceiling: 1_000,
             max_model_calls: 2,
             route: route(model, bound),
+        }
+    }
+
+    fn receipt_query(budget: &HardTokenBudget) -> HardTokenReceiptQuery {
+        let allocation = budget.inner.allocation.as_ref().unwrap();
+        HardTokenReceiptQuery {
+            campaign_id: budget.inner.campaign_id.clone(),
+            manifest_sha256: budget.inner.manifest_sha256.clone(),
+            allocation_id: allocation.id.clone(),
+            packet_id: allocation.packet_id.clone(),
+            baseline_sequence: 0,
+            baseline_revision: 0,
         }
     }
 
@@ -1149,6 +1407,197 @@ mod tests {
             Err(HardTokenBudgetError::CallCeilingExhausted)
         ));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipts_are_contract_scoped_and_preserve_tool_loop_correlations() {
+        let dir = private_dir("receipts-tool-loop");
+        let mut contract = allocation("a", "model-a", 300);
+        contract.token_ceiling = 600;
+        contract.max_model_calls = 2;
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "receipts-tool-loop".into(),
+            600,
+            "d".repeat(64),
+            contract,
+        )
+        .unwrap();
+        let first = budget
+            .reserve_authorized_request(
+                "same-provider-turn",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                123,
+                100,
+            )
+            .unwrap();
+        let second = budget
+            .reserve_authorized_request(
+                "same-provider-turn",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                124,
+                100,
+            )
+            .unwrap();
+        first.settle(41).unwrap();
+
+        let snapshot = budget.receipts(&receipt_query(&budget)).unwrap();
+        assert_eq!(snapshot.receipts.len(), 2);
+        assert_ne!(
+            snapshot.receipts[0].reservation_id,
+            snapshot.receipts[1].reservation_id
+        );
+        assert_ne!(snapshot.receipts[0].sequence, snapshot.receipts[1].sequence);
+        assert_eq!(
+            snapshot.receipts[0].provider_request_id,
+            "same-provider-turn"
+        );
+        assert_eq!(snapshot.receipts[0].actual_tokens, Some(41));
+        assert_eq!(
+            snapshot.receipts[0].terminal_state,
+            HardTokenReceiptTerminalState::SettledUsageReported
+        );
+        assert_eq!(snapshot.receipts[1].actual_tokens, None);
+        assert_eq!(snapshot.receipts[1].charged_tokens, 300);
+        assert_eq!(
+            snapshot.receipts[1].terminal_state,
+            HardTokenReceiptTerminalState::Reserved
+        );
+        drop(second); // cancellation, stream drop, and transport error share this conservative state.
+        let after_drop = budget
+            .receipts(&HardTokenReceiptQuery {
+                baseline_sequence: snapshot.next_sequence,
+                baseline_revision: snapshot.ledger_revision,
+                ..receipt_query(&budget)
+            })
+            .unwrap();
+        assert_eq!(after_drop.receipts.len(), 1);
+        assert_eq!(
+            after_drop.receipts[0].terminal_state,
+            HardTokenReceiptTerminalState::AmbiguousFullReservationCharged
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipts_reject_wrong_contract_and_report_settlement_since_baseline() {
+        let dir = private_dir("receipts-baseline");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "receipts-baseline".into(),
+            1_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 300),
+        )
+        .unwrap();
+        let reservation = budget
+            .reserve_authorized_request(
+                "provider-turn",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                101,
+                100,
+            )
+            .unwrap();
+        let initial = budget.receipts(&receipt_query(&budget)).unwrap();
+        assert_eq!(initial.ledger_revision, 1);
+        let mut wrong = receipt_query(&budget);
+        wrong.packet_id = "wrong-packet".into();
+        assert!(matches!(
+            budget.receipts(&wrong),
+            Err(HardTokenBudgetError::ReceiptContractMismatch)
+        ));
+        let mut invalid_baseline = receipt_query(&budget);
+        invalid_baseline.baseline_sequence = 3;
+        assert!(matches!(
+            budget.receipts(&invalid_baseline),
+            Err(HardTokenBudgetError::ReceiptBaselineInvalid)
+        ));
+
+        let empty_delta = budget
+            .receipts(&HardTokenReceiptQuery {
+                baseline_sequence: initial.next_sequence,
+                baseline_revision: initial.ledger_revision,
+                ..receipt_query(&budget)
+            })
+            .unwrap();
+        assert!(
+            empty_delta.receipts.is_empty(),
+            "a snapshot cursor must be usable immediately"
+        );
+
+        reservation.settle(77).unwrap();
+        let delta = budget
+            .receipts(&HardTokenReceiptQuery {
+                baseline_sequence: initial.next_sequence,
+                baseline_revision: initial.ledger_revision,
+                ..receipt_query(&budget)
+            })
+            .unwrap();
+        assert_eq!(
+            delta.receipts.len(),
+            1,
+            "settlement updates survive a sequence cursor"
+        );
+        assert_eq!(delta.receipts[0].actual_tokens, Some(77));
+        assert_eq!(delta.receipts[0].sequence, 1);
+        assert_eq!(delta.ledger_revision, 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipts_are_credential_and_prompt_free() {
+        let dir = private_dir("receipts-redaction");
+        let ledger = dir.join("ledger.json");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            ledger.clone(),
+            "receipts-redaction".into(),
+            1_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 300),
+        )
+        .unwrap();
+        budget
+            .reserve_authorized_request(
+                "opaque-provider-turn",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                99,
+                100,
+            )
+            .unwrap();
+        let before = fs::read(&ledger).unwrap();
+        let serialized =
+            serde_json::to_string(&budget.receipts(&receipt_query(&budget)).unwrap()).unwrap();
+        assert_eq!(
+            fs::read(&ledger).unwrap(),
+            before,
+            "receipt projection is read-only"
+        );
+        assert!(!serialized.contains("prompt"));
+        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("access_token"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_query_rejects_path_and_unknown_selectors() {
+        let value = serde_json::json!({
+            "campaignId": "campaign",
+            "manifestSha256": "d".repeat(64),
+            "allocationId": "a",
+            "packetId": "packet-a",
+            "baselineSequence": 0,
+            "baselineRevision": 0,
+            "ledgerPath": "/tmp/not-accepted.json",
+        });
+        assert!(serde_json::from_value::<HardTokenReceiptQuery>(value).is_err());
     }
 
     #[test]
