@@ -63,6 +63,7 @@ fn hard_budget_allows_ext_method(method: &str) -> bool {
     matches!(
         method,
         crate::extensions::grokbuild_budget::METHOD
+            | crate::extensions::grokbuild_budget::RECEIPTS_METHOD
             | "x.ai/session/info"
             | "x.ai/session/usage"
             | "x.ai/session/updates"
@@ -2395,6 +2396,9 @@ impl acp::Agent for MvpAgent {
             crate::extensions::grokbuild_budget::METHOD => {
                 crate::extensions::grokbuild_budget::handle(&args).await
             }
+            crate::extensions::grokbuild_budget::RECEIPTS_METHOD => {
+                crate::extensions::grokbuild_budget::handle(&args).await
+            }
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
                 crate::extensions::memory::handle(self, &args).await
             }
@@ -3098,6 +3102,7 @@ mod tool_overrides_capability_tests {
     fn hard_budget_extension_surface_is_exact_and_observational() {
         for method in [
             "com.grokbuild/budget/status",
+            "com.grokbuild/budget/receipts",
             "x.ai/session/info",
             "x.ai/session/usage",
             "x.ai/session/updates",

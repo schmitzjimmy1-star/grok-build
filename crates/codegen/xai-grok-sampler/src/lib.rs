@@ -49,7 +49,8 @@ pub use events::{
 pub use handle::SamplerHandle;
 pub use hard_budget::{
     BudgetReservation, HardTokenAllocationContract, HardTokenBudget, HardTokenBudgetError,
-    HardTokenBudgetStatus, HardTokenRouteContract,
+    HardTokenBudgetStatus, HardTokenReceiptQuery, HardTokenReceiptSnapshot,
+    HardTokenReceiptTerminalState, HardTokenReservationReceipt, HardTokenRouteContract,
 };
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
 pub use retry::{
