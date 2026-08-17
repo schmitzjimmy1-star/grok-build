@@ -735,18 +735,19 @@ impl SessionActor {
             is_cursor,
         );
         let pre_truncation_text = assembled.clone();
-        let (user_message, truncated_local_path) = if hard_budget_armed || verbatim {
-            (assembled, None)
-        } else {
-            self.maybe_truncate_large_prompt_with_skills(
-                context,
-                query,
-                skill_info,
-                is_cursor,
-                current_prompt_index,
-            )
-            .await
-        };
+        let (user_message, truncated_local_path) =
+            if !super::prompt_build::should_offload_large_prompt(verbatim, hard_budget_armed) {
+                (assembled, None)
+            } else {
+                self.maybe_truncate_large_prompt_with_skills(
+                    context,
+                    query,
+                    skill_info,
+                    is_cursor,
+                    current_prompt_index,
+                )
+                .await
+            };
         let was_truncated = truncated_local_path.is_some();
         if let Some(tx) = parsed_prompt_tx {
             let _ = tx.send(ParsedPromptInfo {

@@ -208,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_interactive_times_out() {
-        // Binary writes a link to stderr then blocks; the 5s refresh timeout kills it.
+        // Binary writes a link to stderr then blocks; the bounded refresh timeout kills it.
         let cmd = r#"echo 'Visit http://example.com/auth' >&2; sleep 20; echo token"#;
         let start = std::time::Instant::now();
         let result = run_external_refresh(cmd).await;
@@ -216,7 +216,7 @@ mod tests {
         assert!(result.is_none(), "should timeout and return None");
         assert!(
             elapsed.as_secs() < 10,
-            "refresh should use 5s timeout, not 60s (took {}s)",
+            "refresh must stay within its short bounded timeout, not 60s (took {}s)",
             elapsed.as_secs()
         );
     }
