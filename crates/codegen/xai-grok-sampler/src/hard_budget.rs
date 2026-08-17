@@ -7,20 +7,27 @@
 //! failures therefore consume the full reservation instead of refunding money
 //! the runtime cannot prove was unspent.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const LEDGER_VERSION: u32 = 1;
+const LEDGER_VERSION: u32 = 3;
+const MANIFEST_VERSION: u32 = 1;
 const ENV_LEDGER: &str = "GROK_HARD_TOKEN_BUDGET_LEDGER";
-const ENV_CAMPAIGN: &str = "GROK_HARD_TOKEN_BUDGET_CAMPAIGN";
-const ENV_CEILING: &str = "GROK_HARD_TOKEN_BUDGET_CEILING";
+const ENV_MANIFEST: &str = "GROK_HARD_TOKEN_BUDGET_MANIFEST";
+const ENV_ALLOCATION: &str = "GROK_HARD_TOKEN_BUDGET_ALLOCATION";
 
 #[derive(Debug, thiserror::Error)]
 pub enum HardTokenBudgetError {
@@ -32,6 +39,20 @@ pub enum HardTokenBudgetError {
     InvalidCampaign,
     #[error("hard-token-budget ceiling is invalid")]
     InvalidCeiling,
+    #[error("hard-token-budget manifest is invalid")]
+    InvalidManifest,
+    #[error("hard-token-budget allocation is unavailable")]
+    AllocationUnavailable,
+    #[error("hard-token-budget allocation call ceiling is exhausted")]
+    CallCeilingExhausted,
+    #[error("hard-token-budget request identity is invalid or duplicated")]
+    InvalidRequestIdentity,
+    #[error("hard-token-budget route contract is invalid")]
+    InvalidRouteContract,
+    #[error("hard-token-budget route does not match the frozen contract")]
+    RouteMismatch,
+    #[error("hard-token-budget route contract is required for provider dispatch")]
+    RouteContractRequired,
     #[error("hard-token-budget parent directory is not private and owner-controlled")]
     UnsafeParent,
     #[error("hard-token-budget artifact is not a private owner-controlled regular file")]
@@ -48,6 +69,8 @@ pub enum HardTokenBudgetError {
     AlreadySettled,
     #[error("hard-token-budget arithmetic overflow")]
     Overflow,
+    #[error("hard-token-budget enforcement is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("hard-token-budget I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("hard-token-budget ledger is malformed: {0}")]
@@ -65,9 +88,44 @@ struct HardTokenBudgetInner {
     lock_path: PathBuf,
     campaign_id: String,
     ceiling_tokens: u64,
+    manifest_sha256: String,
+    allocation: Option<HardTokenAllocationContract>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardTokenRouteContract {
+    pub model: String,
+    pub endpoint_sha256: String,
+    pub api_backend: String,
+    pub request_bound_tokens: u64,
+    pub max_payload_bytes: u64,
+    pub max_output_tokens: u64,
+    pub bound_provenance_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardTokenAllocationContract {
+    pub id: String,
+    pub packet_id: String,
+    pub prompt_sha256: String,
+    pub token_ceiling: u64,
+    pub max_model_calls: u64,
+    pub route: HardTokenRouteContract,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HardTokenCampaignManifest {
+    version: u32,
+    campaign_id: String,
+    ceiling_tokens: u64,
+    allocations: Vec<HardTokenAllocationContract>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HardTokenBudgetStatus {
     pub campaign_id: String,
     pub ceiling_tokens: u64,
@@ -76,6 +134,10 @@ pub struct HardTokenBudgetStatus {
     pub remaining_tokens: u64,
     pub violated: bool,
     pub next_sequence: u64,
+    pub manifest_sha256: String,
+    pub allocation_id: Option<String>,
+    pub allocation_remaining_tokens: Option<u64>,
+    pub allocation_remaining_calls: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -92,6 +154,7 @@ struct LedgerState {
     version: u32,
     campaign_id: String,
     ceiling_tokens: u64,
+    manifest_sha256: String,
     next_sequence: u64,
     settled_tokens: u64,
     #[serde(default)]
@@ -106,7 +169,13 @@ struct ReservationRecord {
     id: String,
     sequence: u64,
     request_id: String,
+    allocation_id: Option<String>,
+    packet_id: Option<String>,
     model: String,
+    endpoint_sha256: Option<String>,
+    api_backend: Option<String>,
+    payload_bytes: Option<u64>,
+    max_output_tokens: Option<u64>,
     reserved_tokens: u64,
     actual_tokens: Option<u64>,
 }
@@ -115,25 +184,83 @@ impl HardTokenBudget {
     /// Resolve the all-or-nothing process contract. Ordinary CLI use sees no
     /// budget when all three variables are absent; a partial contract fails.
     pub fn from_env() -> Result<Option<Self>, HardTokenBudgetError> {
-        let ledger = std::env::var_os(ENV_LEDGER);
-        let campaign = std::env::var(ENV_CAMPAIGN).ok();
-        let ceiling = std::env::var(ENV_CEILING).ok();
-        match (ledger, campaign, ceiling) {
+        let values = (
+            std::env::var_os(ENV_LEDGER),
+            std::env::var_os(ENV_MANIFEST),
+            std::env::var(ENV_ALLOCATION).ok(),
+        );
+        match values {
             (None, None, None) => Ok(None),
-            (Some(path), Some(campaign_id), Some(raw_ceiling)) => {
-                let ceiling_tokens = raw_ceiling
-                    .parse::<u64>()
-                    .map_err(|_| HardTokenBudgetError::InvalidCeiling)?;
-                Self::open(PathBuf::from(path), campaign_id, ceiling_tokens).map(Some)
-            }
+            (Some(ledger), Some(manifest), Some(allocation_id)) => Self::open_with_manifest(
+                PathBuf::from(ledger),
+                PathBuf::from(manifest),
+                &allocation_id,
+            )
+            .map(Some),
             _ => Err(HardTokenBudgetError::IncompleteEnvironment),
         }
     }
 
-    pub fn open(
+    pub fn open_with_manifest(
+        ledger_path: PathBuf,
+        manifest_path: PathBuf,
+        allocation_id: &str,
+    ) -> Result<Self, HardTokenBudgetError> {
+        let (manifest, manifest_sha256) = load_manifest(&manifest_path)?;
+        let allocation = manifest
+            .allocations
+            .iter()
+            .find(|allocation| allocation.id == allocation_id)
+            .cloned()
+            .ok_or(HardTokenBudgetError::AllocationUnavailable)?;
+        Self::open_inner(
+            ledger_path,
+            manifest.campaign_id,
+            manifest.ceiling_tokens,
+            manifest_sha256,
+            Some(allocation),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(
         ledger_path: PathBuf,
         campaign_id: String,
         ceiling_tokens: u64,
+    ) -> Result<Self, HardTokenBudgetError> {
+        Self::open_inner(
+            ledger_path,
+            campaign_id,
+            ceiling_tokens,
+            "0".repeat(64),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_allocation_for_test(
+        ledger_path: PathBuf,
+        campaign_id: String,
+        ceiling_tokens: u64,
+        manifest_sha256: String,
+        allocation: HardTokenAllocationContract,
+    ) -> Result<Self, HardTokenBudgetError> {
+        validate_allocation(&allocation)?;
+        Self::open_inner(
+            ledger_path,
+            campaign_id,
+            ceiling_tokens,
+            manifest_sha256,
+            Some(allocation),
+        )
+    }
+
+    fn open_inner(
+        ledger_path: PathBuf,
+        campaign_id: String,
+        ceiling_tokens: u64,
+        manifest_sha256: String,
+        allocation: Option<HardTokenAllocationContract>,
     ) -> Result<Self, HardTokenBudgetError> {
         if !ledger_path.is_absolute() {
             return Err(HardTokenBudgetError::RelativeLedgerPath);
@@ -149,6 +276,7 @@ impl HardTokenBudget {
         if ceiling_tokens == 0 {
             return Err(HardTokenBudgetError::InvalidCeiling);
         }
+        validate_sha256(&manifest_sha256).map_err(|_| HardTokenBudgetError::InvalidManifest)?;
         let parent = ledger_path
             .parent()
             .ok_or(HardTokenBudgetError::UnsafeParent)?;
@@ -164,26 +292,116 @@ impl HardTokenBudget {
                 lock_path,
                 campaign_id,
                 ceiling_tokens,
+                manifest_sha256,
+                allocation,
             }),
         };
         budget.with_locked_state(|_| Ok(()))?;
         Ok(budget)
     }
 
+    pub fn route_contract(&self) -> Option<&HardTokenRouteContract> {
+        self.inner
+            .allocation
+            .as_ref()
+            .map(|allocation| &allocation.route)
+    }
+
+    /// Immutable packet/allocation authority loaded from the private campaign
+    /// manifest. This contains no credential or raw prompt; the prompt is bound
+    /// by its SHA-256 digest so an ACP client can verify that it is presenting
+    /// the exact authorized packet rather than merely a route with spare budget.
+    pub fn allocation_contract(&self) -> Option<&HardTokenAllocationContract> {
+        self.inner.allocation.as_ref()
+    }
+
+    /// Admit one provider dispatch only when its exact live route matches the
+    /// immutable process contract. The reservation size comes from the frozen
+    /// independent bound, never from informational model metadata.
+    pub fn reserve_authorized_request(
+        &self,
+        request_id: &str,
+        model: &str,
+        endpoint_sha256: &str,
+        api_backend: &str,
+        payload_bytes: u64,
+        max_output_tokens: u64,
+    ) -> Result<BudgetReservation, HardTokenBudgetError> {
+        let allocation = self
+            .inner
+            .allocation
+            .as_ref()
+            .ok_or(HardTokenBudgetError::RouteContractRequired)?;
+        let contract = &allocation.route;
+        if model != contract.model
+            || endpoint_sha256 != contract.endpoint_sha256
+            || api_backend != contract.api_backend
+            || payload_bytes > contract.max_payload_bytes
+            || max_output_tokens > contract.max_output_tokens
+        {
+            return Err(HardTokenBudgetError::RouteMismatch);
+        }
+        self.reserve_inner(
+            contract.request_bound_tokens,
+            request_id,
+            model,
+            Some(allocation),
+            Some(endpoint_sha256),
+            Some(api_backend),
+            Some(payload_bytes),
+            Some(max_output_tokens),
+        )
+    }
+
+    #[cfg(test)]
     pub fn reserve(
         &self,
         reserved_tokens: u64,
         request_id: &str,
         model: &str,
     ) -> Result<BudgetReservation, HardTokenBudgetError> {
+        self.reserve_inner(
+            reserved_tokens,
+            request_id,
+            model,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_inner(
+        &self,
+        reserved_tokens: u64,
+        request_id: &str,
+        model: &str,
+        allocation: Option<&HardTokenAllocationContract>,
+        endpoint_sha256: Option<&str>,
+        api_backend: Option<&str>,
+        payload_bytes: Option<u64>,
+        max_output_tokens: Option<u64>,
+    ) -> Result<BudgetReservation, HardTokenBudgetError> {
         if reserved_tokens == 0 {
             return Err(HardTokenBudgetError::InvalidCeiling);
+        }
+        if request_id.is_empty() || request_id.len() > 256 {
+            return Err(HardTokenBudgetError::InvalidRequestIdentity);
         }
         let reservation_id = Uuid::new_v4().to_string();
         let mut sequence = 0;
         self.with_locked_state(|state| {
             if state.violated {
                 return Err(HardTokenBudgetError::Violated);
+            }
+            if state
+                .reservations
+                .iter()
+                .any(|record| record.request_id == request_id)
+            {
+                return Err(HardTokenBudgetError::InvalidRequestIdentity);
             }
             let outstanding = outstanding_tokens(state)?;
             let charged = state
@@ -196,6 +414,20 @@ impl HardTokenBudget {
             if projected > state.ceiling_tokens {
                 return Err(HardTokenBudgetError::Exhausted);
             }
+            if let Some(allocation) = allocation {
+                let (allocation_charged, allocation_calls) =
+                    allocation_charged(state, &allocation.id)?;
+                if allocation_calls >= allocation.max_model_calls {
+                    return Err(HardTokenBudgetError::CallCeilingExhausted);
+                }
+                if allocation_charged
+                    .checked_add(reserved_tokens)
+                    .ok_or(HardTokenBudgetError::Overflow)?
+                    > allocation.token_ceiling
+                {
+                    return Err(HardTokenBudgetError::Exhausted);
+                }
+            }
             sequence = state.next_sequence;
             state.next_sequence = state
                 .next_sequence
@@ -205,7 +437,13 @@ impl HardTokenBudget {
                 id: reservation_id.clone(),
                 sequence,
                 request_id: request_id.to_string(),
+                allocation_id: allocation.map(|value| value.id.clone()),
+                packet_id: allocation.map(|value| value.packet_id.clone()),
                 model: model.to_string(),
+                endpoint_sha256: endpoint_sha256.map(str::to_owned),
+                api_backend: api_backend.map(str::to_owned),
+                payload_bytes,
+                max_output_tokens,
                 reserved_tokens,
                 actual_tokens: None,
             });
@@ -227,6 +465,21 @@ impl HardTokenBudget {
                 .settled_tokens
                 .checked_add(outstanding_tokens)
                 .ok_or(HardTokenBudgetError::Overflow)?;
+            let allocation_status = self
+                .inner
+                .allocation
+                .as_ref()
+                .map(|allocation| {
+                    allocation_charged(state, &allocation.id).map(
+                        |(allocation_charged, allocation_calls)| {
+                            (
+                                allocation.token_ceiling.saturating_sub(allocation_charged),
+                                allocation.max_model_calls.saturating_sub(allocation_calls),
+                            )
+                        },
+                    )
+                })
+                .transpose()?;
             result = Some(HardTokenBudgetStatus {
                 campaign_id: state.campaign_id.clone(),
                 ceiling_tokens: state.ceiling_tokens,
@@ -235,6 +488,14 @@ impl HardTokenBudget {
                 remaining_tokens: state.ceiling_tokens.saturating_sub(charged),
                 violated: state.violated,
                 next_sequence: state.next_sequence,
+                manifest_sha256: state.manifest_sha256.clone(),
+                allocation_id: self
+                    .inner
+                    .allocation
+                    .as_ref()
+                    .map(|allocation| allocation.id.clone()),
+                allocation_remaining_tokens: allocation_status.map(|value| value.0),
+                allocation_remaining_calls: allocation_status.map(|value| value.1),
             });
             Ok(())
         })?;
@@ -287,6 +548,7 @@ impl HardTokenBudget {
                 if state.version != LEDGER_VERSION
                     || state.campaign_id != self.inner.campaign_id
                     || state.ceiling_tokens != self.inner.ceiling_tokens
+                    || state.manifest_sha256 != self.inner.manifest_sha256
                 {
                     return Err(HardTokenBudgetError::IdentityMismatch);
                 }
@@ -299,6 +561,7 @@ impl HardTokenBudget {
                     version: LEDGER_VERSION,
                     campaign_id: self.inner.campaign_id.clone(),
                     ceiling_tokens: self.inner.ceiling_tokens,
+                    manifest_sha256: self.inner.manifest_sha256.clone(),
                     next_sequence: 1,
                     settled_tokens: 0,
                     violated: false,
@@ -309,6 +572,7 @@ impl HardTokenBudget {
         }
     }
 
+    #[cfg(unix)]
     fn persist_state(&self, state: &LedgerState) -> Result<(), HardTokenBudgetError> {
         let parent = self
             .inner
@@ -336,6 +600,11 @@ impl HardTokenBudget {
         }
         write_result
     }
+
+    #[cfg(not(unix))]
+    fn persist_state(&self, _state: &LedgerState) -> Result<(), HardTokenBudgetError> {
+        Err(HardTokenBudgetError::UnsupportedPlatform)
+    }
 }
 
 impl BudgetReservation {
@@ -344,6 +613,118 @@ impl BudgetReservation {
     pub fn settle(self, actual_tokens: u64) -> Result<(), HardTokenBudgetError> {
         self.budget.settle(&self.id, actual_tokens)
     }
+}
+
+fn validate_route_contract(contract: &HardTokenRouteContract) -> Result<(), HardTokenBudgetError> {
+    let conservative_bound = contract
+        .max_payload_bytes
+        .checked_add(contract.max_output_tokens)
+        .ok_or(HardTokenBudgetError::InvalidRouteContract)?;
+    if contract.model.is_empty()
+        || contract.model.len() > 256
+        || contract.request_bound_tokens == 0
+        || contract.max_payload_bytes == 0
+        || contract.max_output_tokens == 0
+        // One serialized UTF-8 byte is charged as at most one input token by
+        // this conservative bound. The output cap is additive and sent in the
+        // exact provider payload. A manifest may reserve more, never less.
+        || conservative_bound > contract.request_bound_tokens
+        || contract.endpoint_sha256.len() != 64
+        || validate_sha256(&contract.endpoint_sha256).is_err()
+        || validate_sha256(&contract.bound_provenance_sha256).is_err()
+        || !matches!(
+            contract.api_backend.as_str(),
+            "chat_completions" | "responses" | "messages"
+        )
+    {
+        return Err(HardTokenBudgetError::InvalidRouteContract);
+    }
+    Ok(())
+}
+
+fn validate_allocation(
+    allocation: &HardTokenAllocationContract,
+) -> Result<(), HardTokenBudgetError> {
+    validate_identifier(&allocation.id).map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+    validate_identifier(&allocation.packet_id)
+        .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+    validate_sha256(&allocation.prompt_sha256)
+        .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+    validate_route_contract(&allocation.route)?;
+    if allocation.token_ceiling == 0
+        || allocation.max_model_calls == 0
+        || allocation.route.request_bound_tokens > allocation.token_ceiling
+    {
+        return Err(HardTokenBudgetError::InvalidManifest);
+    }
+    Ok(())
+}
+
+fn load_manifest(path: &Path) -> Result<(HardTokenCampaignManifest, String), HardTokenBudgetError> {
+    if !path.is_absolute() {
+        return Err(HardTokenBudgetError::RelativeLedgerPath);
+    }
+    let parent = path.parent().ok_or(HardTokenBudgetError::UnsafeParent)?;
+    validate_private_directory(parent)?;
+    let mut file = open_private_file(path, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let manifest_sha256 = sha256_bytes(&bytes);
+    let manifest: HardTokenCampaignManifest = serde_json::from_slice(&bytes)?;
+    if manifest.version != MANIFEST_VERSION
+        || validate_identifier(&manifest.campaign_id).is_err()
+        || manifest.ceiling_tokens == 0
+        || manifest.allocations.is_empty()
+    {
+        return Err(HardTokenBudgetError::InvalidManifest);
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut packet_ids = std::collections::HashSet::new();
+    let mut allocated = 0_u64;
+    for allocation in &manifest.allocations {
+        validate_allocation(allocation)?;
+        if !ids.insert(allocation.id.as_str()) || !packet_ids.insert(allocation.packet_id.as_str())
+        {
+            return Err(HardTokenBudgetError::InvalidManifest);
+        }
+        allocated = allocated
+            .checked_add(allocation.token_ceiling)
+            .ok_or(HardTokenBudgetError::Overflow)?;
+    }
+    if allocated > manifest.ceiling_tokens {
+        return Err(HardTokenBudgetError::InvalidManifest);
+    }
+    Ok((manifest, manifest_sha256))
+}
+
+fn validate_identifier(value: &str) -> Result<(), ()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), ()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn sha256_bytes(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn outstanding_tokens(state: &LedgerState) -> Result<u64, HardTokenBudgetError> {
@@ -357,6 +738,26 @@ fn outstanding_tokens(state: &LedgerState) -> Result<u64, HardTokenBudgetError> 
         })
 }
 
+fn allocation_charged(
+    state: &LedgerState,
+    allocation_id: &str,
+) -> Result<(u64, u64), HardTokenBudgetError> {
+    let mut charged = 0_u64;
+    let mut calls = 0_u64;
+    for record in state
+        .reservations
+        .iter()
+        .filter(|record| record.allocation_id.as_deref() == Some(allocation_id))
+    {
+        calls = calls.checked_add(1).ok_or(HardTokenBudgetError::Overflow)?;
+        charged = charged
+            .checked_add(record.actual_tokens.unwrap_or(record.reserved_tokens))
+            .ok_or(HardTokenBudgetError::Overflow)?;
+    }
+    Ok((charged, calls))
+}
+
+#[cfg(unix)]
 fn validate_private_directory(path: &Path) -> Result<(), HardTokenBudgetError> {
     let metadata = fs::symlink_metadata(path).map_err(HardTokenBudgetError::Io)?;
     if !metadata.file_type().is_dir()
@@ -368,6 +769,12 @@ fn validate_private_directory(path: &Path) -> Result<(), HardTokenBudgetError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn validate_private_directory(_path: &Path) -> Result<(), HardTokenBudgetError> {
+    Err(HardTokenBudgetError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
 fn open_private_file(path: &Path, create: bool) -> Result<File, HardTokenBudgetError> {
     let mut options = OpenOptions::new();
     options
@@ -388,7 +795,12 @@ fn open_private_file(path: &Path, create: bool) -> Result<File, HardTokenBudgetE
     Ok(file)
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+fn open_private_file(_path: &Path, _create: bool) -> Result<File, HardTokenBudgetError> {
+    Err(HardTokenBudgetError::UnsupportedPlatform)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::{Arc, Barrier};
@@ -403,11 +815,52 @@ mod tests {
         path
     }
 
+    fn route(model: &str, bound: u64) -> HardTokenRouteContract {
+        HardTokenRouteContract {
+            model: model.into(),
+            endpoint_sha256: "a".repeat(64),
+            api_backend: "responses".into(),
+            request_bound_tokens: bound,
+            max_payload_bytes: bound - 100,
+            max_output_tokens: 100,
+            bound_provenance_sha256: "b".repeat(64),
+        }
+    }
+
+    fn allocation(id: &str, model: &str, bound: u64) -> HardTokenAllocationContract {
+        HardTokenAllocationContract {
+            id: id.into(),
+            packet_id: format!("packet-{id}"),
+            prompt_sha256: "c".repeat(64),
+            token_ceiling: 1_000,
+            max_model_calls: 2,
+            route: route(model, bound),
+        }
+    }
+
+    fn write_manifest(
+        dir: &Path,
+        ceiling_tokens: u64,
+        allocations: Vec<HardTokenAllocationContract>,
+    ) -> PathBuf {
+        let path = dir.join("manifest.json");
+        let manifest = HardTokenCampaignManifest {
+            version: MANIFEST_VERSION,
+            campaign_id: "campaign".into(),
+            ceiling_tokens,
+            allocations,
+        };
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
     #[test]
     fn concurrent_reservations_cannot_oversubscribe() {
         let dir = private_dir("race");
         let ledger = dir.join("ledger.json");
-        let budget = Arc::new(HardTokenBudget::open(ledger, "race".into(), 1_000).unwrap());
+        let budget =
+            Arc::new(HardTokenBudget::open_for_test(ledger, "race".into(), 1_000).unwrap());
         let barrier = Arc::new(Barrier::new(3));
         let mut joins = Vec::new();
         for index in 0..2 {
@@ -439,10 +892,11 @@ mod tests {
         let dir = private_dir("crash");
         let ledger = dir.join("ledger.json");
         {
-            let budget = HardTokenBudget::open(ledger.clone(), "crash".into(), 1_000).unwrap();
+            let budget =
+                HardTokenBudget::open_for_test(ledger.clone(), "crash".into(), 1_000).unwrap();
             let _ambiguous = budget.reserve(750, "req", "model").unwrap();
         }
-        let reopened = HardTokenBudget::open(ledger, "crash".into(), 1_000).unwrap();
+        let reopened = HardTokenBudget::open_for_test(ledger, "crash".into(), 1_000).unwrap();
         assert!(matches!(
             reopened.reserve(251, "next", "model"),
             Err(HardTokenBudgetError::Exhausted)
@@ -455,7 +909,7 @@ mod tests {
     fn complete_usage_releases_only_the_proven_remainder() {
         let dir = private_dir("settle");
         let ledger = dir.join("ledger.json");
-        let budget = HardTokenBudget::open(ledger, "settle".into(), 1_000).unwrap();
+        let budget = HardTokenBudget::open_for_test(ledger, "settle".into(), 1_000).unwrap();
         budget
             .reserve(800, "req", "model")
             .unwrap()
@@ -472,7 +926,7 @@ mod tests {
     fn usage_above_reservation_marks_ledger_violated() {
         let dir = private_dir("violation");
         let ledger = dir.join("ledger.json");
-        let budget = HardTokenBudget::open(ledger, "violation".into(), 1_000).unwrap();
+        let budget = HardTokenBudget::open_for_test(ledger, "violation".into(), 1_000).unwrap();
         budget
             .reserve(100, "req", "model")
             .unwrap()
@@ -494,7 +948,7 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         let ledger = dir.join("ledger.json");
         symlink(&target, &ledger).unwrap();
-        assert!(HardTokenBudget::open(ledger, "symlink".into(), 1_000).is_err());
+        assert!(HardTokenBudget::open_for_test(ledger, "symlink".into(), 1_000).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"protected");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -504,9 +958,193 @@ mod tests {
         let dir = private_dir("mode");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
         assert!(matches!(
-            HardTokenBudget::open(dir.join("ledger.json"), "mode".into(), 1_000),
+            HardTokenBudget::open_for_test(dir.join("ledger.json"), "mode".into(), 1_000),
             Err(HardTokenBudgetError::UnsafeParent)
         ));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_is_identity_while_multiple_routes_share_one_ledger() {
+        let dir = private_dir("route-identity");
+        let ledger = dir.join("ledger.json");
+        let first = HardTokenBudget::open_with_allocation_for_test(
+            ledger.clone(),
+            "route-identity".into(),
+            2_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 600),
+        )
+        .unwrap();
+        first
+            .reserve_authorized_request(
+                "request-a",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap();
+        let second = HardTokenBudget::open_with_allocation_for_test(
+            ledger.clone(),
+            "route-identity".into(),
+            2_000,
+            "d".repeat(64),
+            allocation("b", "model-b", 600),
+        )
+        .unwrap();
+        second
+            .reserve_authorized_request(
+                "request-b",
+                "model-b",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap();
+        assert_eq!(second.status().unwrap().outstanding_tokens, 1_200);
+        assert!(matches!(
+            HardTokenBudget::open_with_allocation_for_test(
+                ledger,
+                "route-identity".into(),
+                2_000,
+                "e".repeat(64),
+                allocation("b", "model-b", 600),
+            ),
+            Err(HardTokenBudgetError::IdentityMismatch)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorized_reservation_requires_exact_route() {
+        let dir = private_dir("route-match");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "route-match".into(),
+            1_000,
+            "d".repeat(64),
+            allocation("a", "model-a", 600),
+        )
+        .unwrap();
+        assert!(matches!(
+            budget.reserve_authorized_request(
+                "request",
+                "model-a",
+                &"b".repeat(64),
+                "responses",
+                100,
+                100,
+            ),
+            Err(HardTokenBudgetError::RouteMismatch)
+        ));
+        let reservation = budget
+            .reserve_authorized_request(
+                "request",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            )
+            .unwrap();
+        assert_eq!(reservation.reserved_tokens, 600);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_enforces_global_allocation_and_call_ceilings() {
+        let dir = private_dir("manifest");
+        let mut first = allocation("a", "model-a", 300);
+        first.token_ceiling = 600;
+        first.max_model_calls = 2;
+        let mut second = allocation("b", "model-b", 300);
+        second.token_ceiling = 600;
+        let manifest = write_manifest(&dir, 1_200, vec![first, second]);
+        let ledger = dir.join("ledger.json");
+        let budget_a =
+            HardTokenBudget::open_with_manifest(ledger.clone(), manifest.clone(), "a").unwrap();
+        let budget_b = HardTokenBudget::open_with_manifest(ledger, manifest, "b").unwrap();
+
+        for index in 0..2 {
+            budget_a
+                .reserve_authorized_request(
+                    &format!("a-{index}"),
+                    "model-a",
+                    &"a".repeat(64),
+                    "responses",
+                    100,
+                    100,
+                )
+                .unwrap()
+                .settle(50)
+                .unwrap();
+        }
+        assert!(matches!(
+            budget_a.reserve_authorized_request(
+                "a-3",
+                "model-a",
+                &"a".repeat(64),
+                "responses",
+                100,
+                100,
+            ),
+            Err(HardTokenBudgetError::CallCeilingExhausted)
+        ));
+        budget_b
+            .reserve_authorized_request("b-1", "model-b", &"a".repeat(64), "responses", 100, 100)
+            .unwrap();
+        let status = budget_b.status().unwrap();
+        assert_eq!(status.settled_tokens, 100);
+        assert_eq!(status.outstanding_tokens, 300);
+        assert_eq!(status.remaining_tokens, 800);
+        assert_eq!(status.allocation_remaining_tokens, Some(300));
+        assert_eq!(status.allocation_remaining_calls, Some(1));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_allocations_whose_sum_exceeds_campaign() {
+        let dir = private_dir("manifest-overflow");
+        let manifest = write_manifest(
+            &dir,
+            1_000,
+            vec![
+                allocation("a", "model-a", 600),
+                allocation("b", "model-b", 600),
+            ],
+        );
+        assert!(matches!(
+            HardTokenBudget::open_with_manifest(dir.join("ledger.json"), manifest, "a"),
+            Err(HardTokenBudgetError::InvalidManifest)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_packet_identity() {
+        let dir = private_dir("manifest-duplicate-packet");
+        let first = allocation("a", "model-a", 400);
+        let mut second = allocation("b", "model-b", 400);
+        second.packet_id = first.packet_id.clone();
+        let manifest = write_manifest(&dir, 1_000, vec![first, second]);
+        assert!(matches!(
+            HardTokenBudget::open_with_manifest(dir.join("ledger.json"), manifest, "a"),
+            Err(HardTokenBudgetError::InvalidManifest)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn route_bound_must_cover_maximum_payload_bytes_plus_output_tokens() {
+        let mut contract = route("model-a", 600);
+        contract.max_payload_bytes = 501;
+        contract.max_output_tokens = 100;
+        assert!(matches!(
+            validate_route_contract(&contract),
+            Err(HardTokenBudgetError::InvalidRouteContract)
+        ));
     }
 }

@@ -285,6 +285,11 @@ impl VideoGenClient {
         reference_images: Vec<String>,
         reference_voices: Vec<String>,
     ) -> Result<VideoOutcome, xai_tool_runtime::ToolError> {
+        if hard_budget_environment_present() {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "video generation is disabled while the hard token budget is armed",
+            ));
+        }
         let start_url = format!("{}/videos/generations", self.base_url.trim_end_matches('/'));
 
         let presigned = match &self.zdr_video_output_s3 {
@@ -649,6 +654,16 @@ impl VideoGenClient {
         }
         Ok(url)
     }
+}
+
+fn hard_budget_environment_present() -> bool {
+    [
+        "GROK_HARD_TOKEN_BUDGET_LEDGER",
+        "GROK_HARD_TOKEN_BUDGET_MANIFEST",
+        "GROK_HARD_TOKEN_BUDGET_ALLOCATION",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 fn zdr_presign_expires_secs(configured: u64) -> u64 {

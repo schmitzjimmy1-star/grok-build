@@ -309,6 +309,18 @@ impl xai_tool_runtime::Tool for ImageEditTool {
         ctx: xai_tool_runtime::ToolCallContext,
         input: ImageEditInput,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+        if [
+            "GROK_HARD_TOKEN_BUDGET_LEDGER",
+            "GROK_HARD_TOKEN_BUDGET_MANIFEST",
+            "GROK_HARD_TOKEN_BUDGET_ALLOCATION",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "image editing is disabled while the hard token budget is armed",
+            ));
+        }
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
 

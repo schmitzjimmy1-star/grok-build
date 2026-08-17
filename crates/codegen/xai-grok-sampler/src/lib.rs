@@ -47,7 +47,10 @@ pub use events::{
     SamplingChannel, SamplingErrorInfo, SamplingErrorKind, SamplingEvent, StripReason,
 };
 pub use handle::SamplerHandle;
-pub use hard_budget::{BudgetReservation, HardTokenBudget, HardTokenBudgetStatus};
+pub use hard_budget::{
+    BudgetReservation, HardTokenAllocationContract, HardTokenBudget, HardTokenBudgetError,
+    HardTokenBudgetStatus, HardTokenRouteContract,
+};
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
 pub use retry::{
     DEFAULT_MAX_RETRIES, RATE_LIMIT_RETRY_THRESHOLD, RetryDecision, classify_error,
