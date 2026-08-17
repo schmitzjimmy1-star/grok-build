@@ -463,6 +463,8 @@ impl acp::Agent for MvpAgent {
                     "x.ai/capabilities": {
                         "toolOverrides": tool_overrides_capability(),
                     },
+                    (crate::extensions::grokbuild_budget::CAPABILITY_KEY):
+                        crate::extensions::grokbuild_budget::capability_value(),
                 })
                                 .as_object()
                                 .cloned(),
@@ -2244,6 +2246,9 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
+            crate::extensions::grokbuild_budget::METHOD => {
+                crate::extensions::grokbuild_budget::handle(&args).await
+            }
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
                 crate::extensions::memory::handle(self, &args).await
             }

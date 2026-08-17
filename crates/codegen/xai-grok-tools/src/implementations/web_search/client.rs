@@ -206,6 +206,7 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<String>), xai_tool_runtime::ToolError> {
+        refuse_ungoverned_paid_egress()?;
         let (allowed, excluded) = self.resolve_filters(allowed_domains);
         let request = self.build_request_json(query, allowed, excluded)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
@@ -275,6 +276,7 @@ impl WebSearchClient {
         query: &str,
         allowed_domains: Option<Vec<String>>,
     ) -> Result<(String, Vec<(String, String)>), xai_tool_runtime::ToolError> {
+        refuse_ungoverned_paid_egress()?;
         let (allowed, excluded) = self.resolve_filters(allowed_domains);
         let request = self.build_request_json(query, allowed, excluded)?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
@@ -332,6 +334,23 @@ impl WebSearchClient {
         let pairs = extract_citation_pairs(&response_obj);
         Ok((content, pairs))
     }
+}
+
+fn refuse_ungoverned_paid_egress() -> Result<(), xai_tool_runtime::ToolError> {
+    if [
+        "GROK_HARD_TOKEN_BUDGET_LEDGER",
+        "GROK_HARD_TOKEN_BUDGET_MANIFEST",
+        "GROK_HARD_TOKEN_BUDGET_ALLOCATION",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err(xai_tool_runtime::ToolError::execution(
+            xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+            "web search is disabled while the hard token budget is armed",
+        ));
+    }
+    Ok(())
 }
 /// Extract citation URLs from the Response output items.
 /// The async-openai crate doesn't provide a helper for this, and the `url` field

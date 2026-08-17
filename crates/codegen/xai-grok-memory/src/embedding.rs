@@ -107,6 +107,11 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
         &self,
         texts: &[&str],
     ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        if hard_budget_environment_present() {
+            return Err(
+                "memory embeddings are disabled while the hard token budget is armed".into(),
+            );
+        }
         if texts.is_empty() {
             return Ok(vec![]);
         }
@@ -210,6 +215,16 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
     fn dimensions(&self) -> usize {
         self.dimensions
     }
+}
+
+fn hard_budget_environment_present() -> bool {
+    [
+        "GROK_HARD_TOKEN_BUDGET_LEDGER",
+        "GROK_HARD_TOKEN_BUDGET_MANIFEST",
+        "GROK_HARD_TOKEN_BUDGET_ALLOCATION",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 /// A mock embedding provider for testing that returns deterministic vectors.

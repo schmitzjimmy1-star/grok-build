@@ -20,6 +20,7 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use xai_grok_sampling_types::error::{
     parse_error_code, try_parse_stream_error, user_facing_api_error_message,
@@ -33,6 +34,7 @@ use xai_grok_sampling_types::{
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
+use crate::hard_budget::{BudgetReservation, HardTokenBudget, HardTokenBudgetError};
 use xai_grok_auth::bearer_suffix;
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
@@ -370,6 +372,8 @@ pub struct SamplingClient {
     header_injector: Option<crate::config::SharedHeaderInjector>,
     /// Endpoint URL builder, resolved once from `base_url` + `query_params`.
     endpoint: EndpointTemplate,
+    /// Opt-in process-shared governor. Ordinary CLI use leaves it absent.
+    hard_token_budget: Option<HardTokenBudget>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -558,6 +562,229 @@ fn auth_rejected(message: String, sent_bearer: Option<&str>) -> SamplingError {
     }
 }
 
+fn hard_budget_sampling_error(error: HardTokenBudgetError) -> SamplingError {
+    tracing::error!(%error, "hard token budget refused or could not reconcile sampling request");
+    SamplingError::InvalidConfiguration("hard token budget refused sampling request")
+}
+
+fn settle_hard_token_budget(
+    reservation: Option<BudgetReservation>,
+    actual_tokens: u64,
+) -> Result<()> {
+    if let Some(reservation) = reservation {
+        reservation
+            .settle(actual_tokens)
+            .map_err(hard_budget_sampling_error)?;
+    }
+    Ok(())
+}
+
+fn responses_billed_tokens(usage: &rs::ResponseUsage) -> u64 {
+    u64::from(usage.input_tokens).saturating_add(u64::from(usage.output_tokens))
+}
+
+fn hard_budget_backend_label(api_backend: &ApiBackend) -> &'static str {
+    match api_backend {
+        ApiBackend::ChatCompletions => "chat_completions",
+        ApiBackend::Responses => "responses",
+        ApiBackend::Messages => "messages",
+    }
+}
+
+fn hard_budget_backend_path(api_backend: &ApiBackend) -> &'static str {
+    match api_backend {
+        ApiBackend::ChatCompletions => "chat/completions",
+        ApiBackend::Responses => "responses",
+        ApiBackend::Messages => "messages",
+    }
+}
+
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn serialize_provider_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(SamplingError::Serialization)
+}
+
+fn responses_payload_has_hosted_tools(value: &serde_json::Value) -> bool {
+    value
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type").and_then(serde_json::Value::as_str) != Some("function")
+            })
+        })
+}
+
+fn provider_payload_has_unbounded_inputs(
+    api_backend: &ApiBackend,
+    value: &serde_json::Value,
+) -> bool {
+    if matches!(api_backend, ApiBackend::Responses)
+        && ["conversation", "previous_response_id", "prompt"]
+            .iter()
+            .any(|key| value.get(key).is_some_and(|field| !field.is_null()))
+    {
+        return true;
+    }
+    if matches!(api_backend, ApiBackend::ChatCompletions)
+        && value
+            .get("modalities")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() != Some("text")))
+    {
+        return true;
+    }
+
+    let content = match api_backend {
+        ApiBackend::ChatCompletions | ApiBackend::Messages => value.get("messages"),
+        ApiBackend::Responses => value.get("input"),
+    };
+    content.is_some_and(payload_content_has_unbounded_input)
+}
+
+fn payload_content_has_unbounded_input(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(payload_content_has_unbounded_input),
+        serde_json::Value::Object(object) => {
+            let forbidden_type = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "audio"
+                            | "computer_call_output"
+                            | "computer_screenshot"
+                            | "document"
+                            | "file"
+                            | "image"
+                            | "image_url"
+                            | "input_audio"
+                            | "input_file"
+                            | "input_image"
+                            | "item_reference"
+                    )
+                });
+            forbidden_type || object.values().any(payload_content_has_unbounded_input)
+        }
+        _ => false,
+    }
+}
+
+fn hard_budget_chat_stream(
+    mut raw: BoxStream<'static, Result<ChatCompletionChunk>>,
+    reservation: Option<BudgetReservation>,
+) -> BoxStream<'static, Result<ChatCompletionChunk>> {
+    async_stream::stream! {
+        let mut reservation = reservation;
+        let mut terminal_usage = None;
+        let mut saw_error = false;
+        while let Some(item) = raw.next().await {
+            if let Ok(chunk) = &item
+                && let Some(usage) = &chunk.usage
+            {
+                terminal_usage = Some(u64::from(usage.total_tokens));
+            }
+            saw_error |= item.is_err();
+            yield item;
+        }
+        if !saw_error
+            && let Some(actual_tokens) = terminal_usage
+            && let Err(error) = settle_hard_token_budget(reservation.take(), actual_tokens)
+        {
+            yield Err(error);
+        }
+    }
+    .boxed()
+}
+
+fn hard_budget_responses_stream(
+    mut raw: BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+    reservation: Option<BudgetReservation>,
+) -> BoxStream<'static, Result<rs::ResponseStreamEvent>> {
+    async_stream::stream! {
+        let mut reservation = reservation;
+        let mut terminal_usage = None;
+        let mut saw_error = false;
+        while let Some(item) = raw.next().await {
+            if let Ok(rs::ResponseStreamEvent::ResponseCompleted(completed)) = &item
+                && let Some(usage) = &completed.response.usage
+            {
+                // `total_tokens` is intentionally rewritten to live context
+                // length for hosted-loop compaction. Billing remains the
+                // cumulative input/output pair and must govern settlement.
+                terminal_usage = Some(responses_billed_tokens(usage));
+            }
+            saw_error |= item.is_err();
+            yield item;
+        }
+        if !saw_error
+            && let Some(actual_tokens) = terminal_usage
+            && let Err(error) = settle_hard_token_budget(reservation.take(), actual_tokens)
+        {
+            yield Err(error);
+        }
+    }
+    .boxed()
+}
+
+fn hard_budget_messages_stream(
+    mut raw: BoxStream<'static, Result<messages::MessageStreamEvent>>,
+    reservation: Option<BudgetReservation>,
+) -> BoxStream<'static, Result<messages::MessageStreamEvent>> {
+    async_stream::stream! {
+        let mut reservation = reservation;
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut saw_terminal = false;
+        let mut saw_error = false;
+        while let Some(item) = raw.next().await {
+            if let Ok(event) = &item {
+                match event {
+                    messages::MessageStreamEvent::MessageStart { message } => {
+                        input_tokens = Some(
+                            u64::from(message.usage.input_tokens)
+                                + u64::from(message.usage.cache_read_input_tokens)
+                                + u64::from(message.usage.cache_creation_input_tokens),
+                        );
+                    }
+                    messages::MessageStreamEvent::MessageDelta { usage, .. } => {
+                        output_tokens = Some(u64::from(usage.output_tokens));
+                        if let Some(value) = usage.input_tokens {
+                            input_tokens = Some(
+                                u64::from(value)
+                                    + u64::from(usage.cache_read_input_tokens.unwrap_or(0))
+                                    + u64::from(usage.cache_creation_input_tokens.unwrap_or(0)),
+                            );
+                        }
+                    }
+                    messages::MessageStreamEvent::MessageStop => saw_terminal = true,
+                    _ => {}
+                }
+            }
+            saw_error |= item.is_err();
+            yield item;
+        }
+        if !saw_error
+            && saw_terminal
+            && let (Some(input), Some(output)) = (input_tokens, output_tokens)
+            && let Err(error) = settle_hard_token_budget(
+                reservation.take(),
+                input.saturating_add(output),
+            )
+        {
+            yield Err(error);
+        }
+    }
+    .boxed()
+}
+
 // =============================================================================
 // SamplingClient
 // =============================================================================
@@ -570,6 +797,20 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        let hard_token_budget = HardTokenBudget::from_env().map_err(|error| {
+            tracing::error!(%error, "hard token budget initialization refused sampling client");
+            SamplingError::InvalidConfiguration("hard token budget configuration is invalid")
+        })?;
+        Self::new_with_hard_token_budget(config, hard_token_budget)
+    }
+
+    /// Explicit constructor for shell integration and hostile tests. The
+    /// default constructor reads the process contract so auxiliary clients
+    /// cannot silently omit an enabled governor.
+    pub(crate) fn new_with_hard_token_budget(
+        config: SamplerConfig,
+        hard_token_budget: Option<HardTokenBudget>,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -673,11 +914,19 @@ impl SamplingClient {
             }
         }
 
-        let http = if config.force_http1 {
-            tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
-            crate::shared_http::client_http1().map_err(SamplingError::Http)?
-        } else {
-            crate::shared_http::client().map_err(SamplingError::Http)?
+        let http = match (config.force_http1, hard_token_budget.is_some()) {
+            (true, true) => {
+                tracing::info!("Using redirect-free HTTP/1.1 for hard-budget sampling client");
+                crate::shared_http::client_http1_no_redirect().map_err(SamplingError::Http)?
+            }
+            (true, false) => {
+                tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
+                crate::shared_http::client_http1().map_err(SamplingError::Http)?
+            }
+            (false, true) => {
+                crate::shared_http::client_no_redirect().map_err(SamplingError::Http)?
+            }
+            (false, false) => crate::shared_http::client().map_err(SamplingError::Http)?,
         };
 
         tracing::info!(
@@ -719,12 +968,61 @@ impl SamplingClient {
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
             endpoint,
+            hard_token_budget,
         })
+    }
+
+    fn reserve_hard_token_budget(
+        &self,
+        request_id: &str,
+        model: &str,
+        api_backend: ApiBackend,
+        payload_bytes: usize,
+        max_output_tokens: Option<u32>,
+        has_unbounded_provider_work: bool,
+    ) -> Result<Option<BudgetReservation>> {
+        let Some(budget) = &self.hard_token_budget else {
+            return Ok(None);
+        };
+        if max_output_tokens.is_none_or(|tokens| tokens == 0) {
+            return Err(SamplingError::InvalidConfiguration(
+                "hard token budget requires a positive output-token cap",
+            ));
+        }
+        if has_unbounded_provider_work {
+            return Err(SamplingError::InvalidConfiguration(
+                "hard token budget does not permit unbounded provider-side work or inputs",
+            ));
+        }
+        let endpoint_sha256 = sha256_hex(
+            &self
+                .endpoint
+                .url_for_path(hard_budget_backend_path(&api_backend)),
+        );
+        budget
+            .reserve_authorized_request(
+                request_id,
+                model,
+                &endpoint_sha256,
+                hard_budget_backend_label(&api_backend),
+                u64::try_from(payload_bytes).map_err(|_| {
+                    SamplingError::InvalidConfiguration(
+                        "hard token budget payload length is unsupported",
+                    )
+                })?,
+                u64::from(max_output_tokens.unwrap_or_default()),
+            )
+            .map(Some)
+            .map_err(hard_budget_sampling_error)
     }
 
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
+    }
+
+    pub(crate) fn hard_token_budget_enabled(&self) -> bool {
+        self.hard_token_budget.is_some()
     }
 
     /// POST with default headers, returning the builder coupled to the tail
@@ -989,7 +1287,22 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
-        let http_request = grok_headers.apply(builder).json(&payload);
+        let payload_bytes = serialize_provider_payload(&payload)?;
+        let payload_value =
+            serde_json::from_slice(&payload_bytes).map_err(SamplingError::Serialization)?;
+        let http_request = grok_headers.apply(builder).body(payload_bytes.clone());
+        let reservation = self.reserve_hard_token_budget(
+            x_grok_req_id,
+            &model_id,
+            ApiBackend::ChatCompletions,
+            payload_bytes.len(),
+            payload.max_tokens,
+            payload.search_parameters.is_some()
+                || provider_payload_has_unbounded_inputs(
+                    &ApiBackend::ChatCompletions,
+                    &payload_value,
+                ),
+        )?;
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -997,7 +1310,21 @@ impl SamplingClient {
             e
         })?;
 
-        self.handle_response(response, sent_bearer.as_deref()).await
+        let completion = self
+            .handle_response(response, sent_bearer.as_deref())
+            .await?;
+        match completion.usage.as_ref() {
+            Some(usage) => {
+                settle_hard_token_budget(reservation, u64::from(usage.total_tokens))?;
+            }
+            None if reservation.is_some() => {
+                return Err(SamplingError::InvalidConfiguration(
+                    "hard token budget requires complete terminal usage",
+                ));
+            }
+            None => {}
+        }
+        Ok(completion)
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -1049,10 +1376,13 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
+        let payload_bytes = serialize_provider_payload(&streaming_request)?;
+        let payload_value =
+            serde_json::from_slice(&payload_bytes).map_err(SamplingError::Serialization)?;
         let http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&streaming_request);
+            .body(payload_bytes.clone());
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1065,6 +1395,18 @@ impl SamplingClient {
             "Sending chat/completions request"
         );
         Self::log_request_headers(&built_request, "chat/completions");
+        let reservation = self.reserve_hard_token_budget(
+            x_grok_req_id,
+            &model_id,
+            ApiBackend::ChatCompletions,
+            payload_bytes.len(),
+            payload.max_tokens,
+            payload.search_parameters.is_some()
+                || provider_payload_has_unbounded_inputs(
+                    &ApiBackend::ChatCompletions,
+                    &payload_value,
+                ),
+        )?;
 
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1181,7 +1523,7 @@ impl SamplingClient {
             })
             .boxed();
 
-        Ok((chunks, model_metadata))
+        Ok((hard_budget_chat_stream(chunks, reservation), model_metadata))
     }
 
     // =========================================================================
@@ -1268,11 +1610,22 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        let has_unbounded_provider_work = responses_payload_has_hosted_tools(&request_body)
+            || provider_payload_has_unbounded_inputs(&ApiBackend::Responses, &request_body);
+        let payload_bytes = serialize_provider_payload(&request_body)?;
         let SentRequest {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers.apply(builder).json(&request_body);
+        let http_request = grok_headers.apply(builder).body(payload_bytes.clone());
+        let reservation = self.reserve_hard_token_budget(
+            x_grok_req_id,
+            &model_id,
+            ApiBackend::Responses,
+            payload_bytes.len(),
+            request.inner.max_output_tokens,
+            has_unbounded_provider_work,
+        )?;
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1326,6 +1679,17 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
+        match response_obj.usage.as_ref() {
+            Some(usage) => {
+                settle_hard_token_budget(reservation, responses_billed_tokens(usage))?;
+            }
+            None if reservation.is_some() => {
+                return Err(SamplingError::InvalidConfiguration(
+                    "hard token budget requires complete terminal usage",
+                ));
+            }
+            None => {}
+        }
         Ok(response_obj)
     }
 
@@ -1404,6 +1768,9 @@ impl SamplingClient {
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        let has_unbounded_provider_work = responses_payload_has_hosted_tools(&request_body)
+            || provider_payload_has_unbounded_inputs(&ApiBackend::Responses, &request_body);
+        let payload_bytes = serialize_provider_payload(&request_body)?;
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
@@ -1421,7 +1788,7 @@ impl SamplingClient {
             http_request =
                 http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
         }
-        let http_request = http_request.json(&request_body);
+        let http_request = http_request.body(payload_bytes.clone());
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1434,6 +1801,14 @@ impl SamplingClient {
             "Sending responses API stream request"
         );
         Self::log_request_headers(&built_request, "responses");
+        let reservation = self.reserve_hard_token_budget(
+            x_grok_req_id,
+            &model_id,
+            ApiBackend::Responses,
+            payload_bytes.len(),
+            request.inner.max_output_tokens,
+            has_unbounded_provider_work,
+        )?;
 
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1555,7 +1930,11 @@ impl SamplingClient {
             .filter_map(std::future::ready)
             .boxed();
 
-        Ok((events, model_metadata, doom_loop))
+        Ok((
+            hard_budget_responses_stream(events, reservation),
+            model_metadata,
+            doom_loop,
+        ))
     }
 
     // =========================================================================
@@ -1620,7 +1999,18 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("messages"));
-        let http_request = grok_headers.apply(builder).json(&request.inner);
+        let payload_bytes = serialize_provider_payload(&request.inner)?;
+        let payload_value =
+            serde_json::from_slice(&payload_bytes).map_err(SamplingError::Serialization)?;
+        let http_request = grok_headers.apply(builder).body(payload_bytes.clone());
+        let reservation = self.reserve_hard_token_budget(
+            x_grok_req_id,
+            &model_id,
+            ApiBackend::Messages,
+            payload_bytes.len(),
+            Some(request.inner.max_tokens),
+            provider_payload_has_unbounded_inputs(&ApiBackend::Messages, &payload_value),
+        )?;
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1675,6 +2065,11 @@ impl SamplingClient {
                 );
                 SamplingError::Serialization(e)
             })?;
+        let actual_tokens = u64::from(response_obj.usage.input_tokens)
+            + u64::from(response_obj.usage.cache_read_input_tokens)
+            + u64::from(response_obj.usage.cache_creation_input_tokens)
+            + u64::from(response_obj.usage.output_tokens);
+        settle_hard_token_budget(reservation, actual_tokens)?;
         Ok(response_obj)
     }
 
@@ -1734,10 +2129,13 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("messages"));
+        let payload_bytes = serialize_provider_payload(&request.inner)?;
+        let payload_value =
+            serde_json::from_slice(&payload_bytes).map_err(SamplingError::Serialization)?;
         let http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&request.inner);
+            .body(payload_bytes.clone());
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1750,6 +2148,14 @@ impl SamplingClient {
             "Sending messages API stream request"
         );
         Self::log_request_headers(&built_request, "messages");
+        let reservation = self.reserve_hard_token_budget(
+            x_grok_req_id,
+            &model_id,
+            ApiBackend::Messages,
+            payload_bytes.len(),
+            Some(request.inner.max_tokens),
+            provider_payload_has_unbounded_inputs(&ApiBackend::Messages, &payload_value),
+        )?;
 
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1867,7 +2273,10 @@ impl SamplingClient {
             })
             .boxed();
 
-        Ok((events, model_metadata))
+        Ok((
+            hard_budget_messages_stream(events, reservation),
+            model_metadata,
+        ))
     }
 
     // =========================================================================
@@ -2137,6 +2546,8 @@ mod tests {
     use super::*;
     use axum::{Router, body::Bytes, routing::post};
     use indexmap::IndexMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use xai_grok_sampling_types::ApiErrorCode;
@@ -2248,6 +2659,485 @@ mod tests {
             doom_loop_recovery: None,
             header_injector: None,
         }
+    }
+
+    fn private_budget_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "grok-sampler-client-budget-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn test_chat_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: Some("test-model".into()),
+            messages: vec![ChatRequestMessage::user("hello")],
+            temperature: None,
+            max_tokens: Some(100),
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            search_parameters: None,
+            response_format: None,
+            reasoning_effort: None,
+            x_grok_conv_id: None,
+            x_grok_req_id: Some("budget-request".into()),
+            x_grok_session_id: None,
+            x_grok_turn_idx: None,
+            x_grok_agent_id: None,
+            x_grok_deployment_id: None,
+            x_grok_user_id: None,
+            trace: None,
+        }
+    }
+
+    async fn chat_server() -> (
+        String,
+        std::sync::Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let handler_calls = std::sync::Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let handler_calls = std::sync::Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            r#"{"id":"chat","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":40,"completion_tokens":10,"total_tokens":50}}"#,
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), calls, server)
+    }
+
+    async fn responses_server() -> (
+        String,
+        std::sync::Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let handler_calls = std::sync::Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let handler_calls = std::sync::Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"id":"resp","object":"response","created_at":0,"model":"test-model","status":"completed","output":[],"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}"#))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), calls, server)
+    }
+
+    fn chat_route_contract(
+        base_url: &str,
+        request_bound_tokens: u64,
+    ) -> crate::hard_budget::HardTokenRouteContract {
+        let endpoint =
+            EndpointTemplate::new(base_url, &IndexMap::new()).url_for_path("chat/completions");
+        crate::hard_budget::HardTokenRouteContract {
+            model: "test-model".into(),
+            endpoint_sha256: sha256_hex(&endpoint),
+            api_backend: "chat_completions".into(),
+            request_bound_tokens,
+            max_payload_bytes: request_bound_tokens - 100,
+            max_output_tokens: 100,
+            bound_provenance_sha256: "b".repeat(64),
+        }
+    }
+
+    fn chat_allocation(
+        base_url: &str,
+        request_bound_tokens: u64,
+    ) -> crate::hard_budget::HardTokenAllocationContract {
+        crate::hard_budget::HardTokenAllocationContract {
+            id: "chat-packet".into(),
+            packet_id: "chat-packet".into(),
+            prompt_sha256: "c".repeat(64),
+            token_ceiling: 1_000,
+            max_model_calls: 4,
+            route: chat_route_contract(base_url, request_bound_tokens),
+        }
+    }
+
+    fn responses_allocation(
+        base_url: &str,
+        request_bound_tokens: u64,
+    ) -> crate::hard_budget::HardTokenAllocationContract {
+        let endpoint = EndpointTemplate::new(base_url, &IndexMap::new()).url_for_path("responses");
+        crate::hard_budget::HardTokenAllocationContract {
+            id: "responses-packet".into(),
+            packet_id: "responses-packet".into(),
+            prompt_sha256: "c".repeat(64),
+            token_ceiling: 1_000,
+            max_model_calls: 4,
+            route: crate::hard_budget::HardTokenRouteContract {
+                model: "test-model".into(),
+                endpoint_sha256: sha256_hex(&endpoint),
+                api_backend: "responses".into(),
+                request_bound_tokens,
+                max_payload_bytes: request_bound_tokens - 100,
+                max_output_tokens: 100,
+                bound_provenance_sha256: "b".repeat(64),
+            },
+        }
+    }
+
+    #[test]
+    fn hard_budget_payload_filter_rejects_indirect_and_multimodal_inputs() {
+        let cases = [
+            (
+                ApiBackend::Responses,
+                serde_json::json!({"previous_response_id":"resp_123","input":"hi"}),
+            ),
+            (
+                ApiBackend::Responses,
+                serde_json::json!({"input":[{"type":"input_image","image_url":"https://example.invalid/huge.png"}]}),
+            ),
+            (
+                ApiBackend::ChatCompletions,
+                serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/huge.png"}}]}]}),
+            ),
+            (
+                ApiBackend::ChatCompletions,
+                serde_json::json!({"messages":[],"modalities":["text","audio"]}),
+            ),
+            (
+                ApiBackend::Messages,
+                serde_json::json!({"messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":"https://example.invalid/huge.pdf"}}]}]}),
+            ),
+        ];
+        for (backend, payload) in cases {
+            assert!(provider_payload_has_unbounded_inputs(&backend, &payload));
+        }
+        assert!(!provider_payload_has_unbounded_inputs(
+            &ApiBackend::Responses,
+            &serde_json::json!({"input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"function_call","name":"printf","arguments":"{}","call_id":"1"},
+                {"type":"function_call_output","call_id":"1","output":"ok"}
+            ]})
+        ));
+    }
+
+    #[tokio::test]
+    async fn hard_budget_remote_response_reference_is_refused_before_provider_dispatch() {
+        let (base_url, calls, server) = responses_server().await;
+        let dir = private_budget_dir("responses-reference");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "responses-reference".into(),
+            1_000,
+            "d".repeat(64),
+            responses_allocation(&base_url, 600),
+        )
+        .unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url,
+                api_backend: ApiBackend::Responses,
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget.clone()),
+        )
+        .unwrap();
+        let mut request = rs::CreateResponse {
+            input: rs::InputParam::Text("tiny wire payload".into()),
+            model: Some("test-model".into()),
+            max_output_tokens: Some(100),
+            previous_response_id: Some("resp_unbounded".into()),
+            ..Default::default()
+        };
+        let mut unary = CreateResponseWrapper::new(request.clone());
+        unary.x_grok_req_id = Some("remote-reference-unary".into());
+        assert!(client.create_response(unary).await.is_err());
+        request.previous_response_id = None;
+        request.prompt = Some(rs::Prompt {
+            id: "prompt_unbounded".into(),
+            variables: None,
+            version: None,
+        });
+        let mut streaming = CreateResponseWrapper::new(request);
+        streaming.x_grok_req_id = Some("remote-reference-stream".into());
+        assert!(client.create_response_stream(streaming).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let status = budget.status().unwrap();
+        assert_eq!(status.outstanding_tokens, 0);
+        assert_eq!(status.allocation_remaining_calls, Some(4));
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_budget_refuses_before_the_provider_sees_a_request() {
+        let (base_url, calls, server) = chat_server().await;
+        let dir = private_budget_dir("refuse");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "refuse".into(),
+            1_000,
+            "d".repeat(64),
+            chat_allocation(&base_url, 600),
+        )
+        .unwrap();
+        let _prior_ambiguous = budget.reserve(500, "prior", "test-model").unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url: base_url.clone(),
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.chat_completion(test_chat_request()).await,
+            Err(SamplingError::InvalidConfiguration(
+                "hard token budget refused sampling request"
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_budget_reconciles_only_complete_provider_usage() {
+        let (base_url, calls, server) = chat_server().await;
+        let dir = private_budget_dir("settle");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "settle".into(),
+            1_000,
+            "d".repeat(64),
+            chat_allocation(&base_url, 600),
+        )
+        .unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url: base_url.clone(),
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget.clone()),
+        )
+        .unwrap();
+
+        let response = client.chat_completion(test_chat_request()).await.unwrap();
+        assert_eq!(response.usage.unwrap().total_tokens, 50);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let status = budget.status().unwrap();
+        assert_eq!(status.settled_tokens, 50);
+        assert_eq!(status.outstanding_tokens, 0);
+        assert_eq!(status.remaining_tokens, 950);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_budget_route_mismatch_is_refused_before_dispatch() {
+        let (base_url, calls, server) = chat_server().await;
+        let dir = private_budget_dir("route-mismatch");
+        let mut contract = chat_route_contract(&base_url, 600);
+        contract.endpoint_sha256 = "0".repeat(64);
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "route-mismatch".into(),
+            1_000,
+            "d".repeat(64),
+            crate::hard_budget::HardTokenAllocationContract {
+                id: "chat-packet".into(),
+                packet_id: "chat-packet".into(),
+                prompt_sha256: "c".repeat(64),
+                token_ceiling: 1_000,
+                max_model_calls: 4,
+                route: contract,
+            },
+        )
+        .unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url,
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.chat_completion(test_chat_request()).await,
+            Err(SamplingError::InvalidConfiguration(
+                "hard token budget refused sampling request"
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_budget_oversized_final_payload_is_refused_before_dispatch() {
+        let (base_url, calls, server) = chat_server().await;
+        let dir = private_budget_dir("oversized-payload");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "oversized-payload".into(),
+            1_000,
+            "d".repeat(64),
+            chat_allocation(&base_url, 600),
+        )
+        .unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url,
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget),
+        )
+        .unwrap();
+        let mut request = test_chat_request();
+        request.messages = vec![ChatRequestMessage::user("x".repeat(20_000))];
+
+        assert!(matches!(
+            client.chat_completion(request).await,
+            Err(SamplingError::InvalidConfiguration(
+                "hard token budget refused sampling request"
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_budget_does_not_follow_provider_redirects() {
+        let redirected_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let target_calls = std::sync::Arc::clone(&redirected_calls);
+        let target_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let target_calls = std::sync::Arc::clone(&target_calls);
+                async move {
+                    target_calls.fetch_add(1, Ordering::SeqCst);
+                    "unexpected"
+                }
+            }),
+        );
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_server = tokio::spawn(async move {
+            let _ = axum::serve(target_listener, target_app).await;
+        });
+
+        let location = format!("http://{target_addr}/v1/chat/completions");
+        let redirect_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let location = location.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(307)
+                        .header("location", location)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn(async move {
+            let _ = axum::serve(redirect_listener, redirect_app).await;
+        });
+        let base_url = format!("http://{redirect_addr}/v1");
+        let dir = private_budget_dir("redirect");
+        let budget = HardTokenBudget::open_with_allocation_for_test(
+            dir.join("ledger.json"),
+            "redirect".into(),
+            1_000,
+            "d".repeat(64),
+            chat_allocation(&base_url, 600),
+        )
+        .unwrap();
+        let client = SamplingClient::new_with_hard_token_budget(
+            SamplerConfig {
+                base_url,
+                max_completion_tokens: Some(100),
+                ..minimal_config()
+            },
+            Some(budget.clone()),
+        )
+        .unwrap();
+
+        assert!(client.chat_completion(test_chat_request()).await.is_err());
+        assert_eq!(redirected_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.status().unwrap().outstanding_tokens, 600);
+        redirect_server.abort();
+        target_server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_budget_stream_error_keeps_full_reservation_charged() {
+        let dir = private_budget_dir("stream-error");
+        let budget =
+            HardTokenBudget::open_for_test(dir.join("ledger.json"), "stream-error".into(), 1_000)
+                .unwrap();
+        let reservation = budget.reserve(600, "request", "test-model").unwrap();
+        let usage_chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chat",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 40,
+                "completion_tokens": 10,
+                "total_tokens": 50
+            }
+        }))
+        .unwrap();
+        let raw = futures_util::stream::iter(vec![
+            Ok(usage_chunk),
+            Err(SamplingError::InvalidConfiguration("later stream failure")),
+        ])
+        .boxed();
+        let mut guarded = hard_budget_chat_stream(raw, Some(reservation));
+        while guarded.next().await.is_some() {}
+
+        let status = budget.status().unwrap();
+        assert_eq!(status.settled_tokens, 0);
+        assert_eq!(status.outstanding_tokens, 600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the
@@ -3076,6 +3966,7 @@ mod tests {
         // total_tokens rewritten to ctx.input + ctx.output (5022 + 571).
         // NOT the wire's cumulative total (6714).
         assert_eq!(usage.total_tokens, 5_593);
+        assert_eq!(responses_billed_tokens(&usage), 6_714);
     }
 
     #[test]

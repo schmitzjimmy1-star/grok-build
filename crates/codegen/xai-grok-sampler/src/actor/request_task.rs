@@ -94,12 +94,6 @@ pub(crate) async fn run_request_task(
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
     );
     let configured_max_retries = config.max_retries.or(Some(retry_policy.max_retries));
-    let max_retries = if configured_max_retries == Some(0) {
-        0
-    } else {
-        resolve_max_retries(configured_max_retries)
-    };
-
     // Build the initial client. Configuration errors here are fatal
     // (no point retrying with the same broken config).
     let mut client = match SamplingClient::new(config.clone()) {
@@ -109,6 +103,14 @@ pub(crate) async fn run_request_task(
             send_completion(&mut completion_tx, Err(err));
             return request_id;
         }
+    };
+    // A retry is a second potentially billable provider dispatch. The first
+    // hard-budget release forbids automatic retries; callers may issue a new
+    // explicit request only after the prior reservation is reconciled.
+    let max_retries = if client.hard_token_budget_enabled() || configured_max_retries == Some(0) {
+        0
+    } else {
+        resolve_max_retries(configured_max_retries)
     };
 
     let sampling_span = crate::sampling_log::request_span(
