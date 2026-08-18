@@ -266,6 +266,9 @@ pub async fn create_terminal(
     cwd: Option<&str>,
     output_byte_limit: Option<usize>,
 ) -> Result<String, String> {
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        return Err("terminal creation is disabled while the hard-token budget is armed".into());
+    }
     let terminal_id = uuid::Uuid::now_v7().to_string();
     let output_byte_limit = output_byte_limit.unwrap_or(super::DEFAULT_OUTPUT_BYTE_LIMIT);
 

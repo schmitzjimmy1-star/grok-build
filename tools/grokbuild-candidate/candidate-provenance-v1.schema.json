@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grokbuild.local/schema/candidate-provenance-v1.json",
+  "title": "GrokBuild Candidate Provenance V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "source", "toolchain", "build", "binary", "signing"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["officialBaseSHA", "upstreamReplayBaseSHA", "forkSourceSHA", "sourceRev", "cargoLockSHA256"],
+      "properties": {
+        "officialBaseSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "upstreamReplayBaseSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "forkSourceSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "sourceRev": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "cargoLockSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustVersion", "cargoVersion", "dotslashVersion", "rustcSHA256", "cargoSHA256", "dotslashSHA256", "targetTriple", "architecture"],
+      "properties": {
+        "rustVersion": {"type": "string", "pattern": "^rustc 1\\.94\\.0 "},
+        "cargoVersion": {"type": "string", "pattern": "^cargo 1\\.94\\.0 "},
+        "dotslashVersion": {"const": "DotSlash 0.5.7"},
+        "rustcSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "cargoSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "dotslashSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "targetTriple": {"type": "string", "minLength": 1},
+        "architecture": {"enum": ["arm64", "x86_64"]}
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preBuildCommand", "command", "environment", "profile", "package", "features"],
+      "properties": {
+        "preBuildCommand": {"const": ["cargo", "clean", "--target-dir", "<candidate-target>", "--profile", "release-dist", "-p", "xai-grok-pager-bin"]},
+        "command": {"const": ["cargo", "build", "--locked", "--profile", "release-dist", "-p", "xai-grok-pager-bin", "--features", "release-dist"]},
+        "environment": {
+          "const": {
+            "clearEnvironment": true,
+            "home": "<account-home>",
+            "path": ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "<dotslash-directory>"],
+            "cargoHome": "<account-home>/.cargo",
+            "rustupHome": "<account-home>/.rustup",
+            "rustc": "<pinned-rustc>",
+            "cargoTargetDir": "<candidate-target>",
+            "cargoIncremental": false,
+            "locale": "C",
+            "temporaryDirectory": "/private/tmp"
+          }
+        },
+        "profile": {"const": "release-dist"},
+        "package": {"const": "xai-grok-pager-bin"},
+        "features": {"const": ["release-dist"]}
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactName", "sha256", "sizeBytes", "architecture", "expectedVersionWithCommit", "expectedACPCLIBuild", "observedVersionWithCommit"],
+      "properties": {
+        "artifactName": {"const": "xai-grok-pager"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sizeBytes": {"type": "integer", "minimum": 1},
+        "architecture": {"enum": ["arm64", "x86_64"]},
+        "expectedVersionWithCommit": {"type": "string", "minLength": 1},
+        "expectedACPCLIBuild": {"type": "string", "minLength": 1},
+        "observedVersionWithCommit": {"type": "string", "minLength": 1}
+      }
+    },
+    "signing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "strictVerification", "teamIdentifier", "designatedRequirement"],
+      "properties": {
+        "state": {"enum": ["unsigned", "adHoc", "signed", "unsupported"]},
+        "strictVerification": {"type": "boolean"},
+        "teamIdentifier": {"type": ["string", "null"]},
+        "designatedRequirement": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

@@ -105,7 +105,9 @@ fn print_serve_startup_info(bind_addr: SocketAddr, secret: &str) {
 const HEADLESS_ENTRYPOINT: &str = "headless";
 /// Initialize simple tracing for non-TUI agent modes.
 fn init_tracing_simple(app_entrypoint: &'static str) {
-    use tracing_subscriber::{EnvFilter, Layer as _, fmt, layer::SubscriberExt as _};
+    use tracing_subscriber::{
+        EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+    };
     use xai_grok_telemetry::debug_log::RMCP_SSE_NOISE_TARGET;
     let default_filter = if app_entrypoint == HEADLESS_ENTRYPOINT {
         "off"
@@ -124,6 +126,16 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
         .with_target(false)
         .with_ansi(true)
         .with_writer(std::io::stderr);
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        // The armed process must not honor ambient file-log destinations: the
+        // app inherits its parent environment, and those layers can create,
+        // append, prune, or truncate arbitrary same-user paths before ACP
+        // authorization. Stderr is the only armed tracing sink.
+        tracing_subscriber::registry()
+            .with(fmt_layer.with_filter(env_filter))
+            .init();
+        return;
+    }
     let registry = tracing_subscriber::registry()
         .with(fmt_layer.with_filter(env_filter))
         .with(xai_grok_telemetry::sampling_log::layer())
@@ -1055,6 +1067,14 @@ async fn forward_stdio_line_to_leader(
 /// can't drift.
 const PLUGIN_DIR_LEADER_WARNING: &str = "grok: --plugin-dir is ignored in leader mode; run with --no-leader to \
      load per-process plugins";
+
+fn require_hard_budget_stdio(hard_budget_armed: bool, is_stdio: bool) -> Result<()> {
+    if hard_budget_armed && !is_stdio {
+        anyhow::bail!("the GrokBuild hard-token budget requires `grok agent stdio`");
+    }
+    Ok(())
+}
+
 /// Run the `agent` subcommand, dispatching to the appropriate mode.
 async fn run_agent_command(
     agent_args: Box<xai_grok_pager::app::AgentArgs>,
@@ -1064,6 +1084,9 @@ async fn run_agent_command(
     disable_web_search: bool,
     update_config: &UpdateConfig,
 ) -> Result<()> {
+    let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
+    let is_stdio = matches!(agent_args.mode, Some(AgentCmd::Stdio));
+    require_hard_budget_stdio(hard_budget_armed, is_stdio)?;
     let _signal_flush = tokio::spawn(async {
         #[cfg(unix)]
         {
@@ -1090,6 +1113,9 @@ async fn run_agent_command(
     init_tracing_simple("agent");
     let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
     xai_grok_telemetry::instrumentation::install_panic_hook();
+    if hard_budget_armed && trust {
+        anyhow::bail!("--trust is disabled while the GrokBuild hard-token budget is armed");
+    }
     if trust {
         match std::env::current_dir() {
             Ok(cwd) => xai_grok_shell::agent::folder_trust::grant_folder_trust(&cwd),
@@ -1098,9 +1124,14 @@ async fn run_agent_command(
             }
         }
     }
-    let early_prefetch = xai_grok_shell::agent::models::start_early_prefetch(None);
-    xai_grok_shell::agent::mvp_agent::warm_async_http_client();
-    let is_stdio = matches!(agent_args.mode, Some(AgentCmd::Stdio));
+    let early_prefetch = if hard_budget_armed {
+        None
+    } else {
+        xai_grok_shell::agent::models::start_early_prefetch(None)
+    };
+    if !hard_budget_armed {
+        xai_grok_shell::agent::mvp_agent::warm_async_http_client();
+    }
     let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
     if !is_stdio && !is_leader {
         eprintln!(
@@ -1151,6 +1182,9 @@ async fn run_agent_command(
         .as_deref()
         .map(resolve_agent_profile_path);
     agent_config.client_version = Some(PAGER_CLIENT_VERSION.to_string());
+    if hard_budget_armed && !agent_args.plugin_dirs.is_empty() {
+        anyhow::bail!("--plugin-dir is disabled while the GrokBuild hard-token budget is armed");
+    }
     if is_leader && !agent_args.plugin_dirs.is_empty() {
         eprintln!("{PLUGIN_DIR_LEADER_WARNING}");
     } else {
@@ -1171,14 +1205,18 @@ async fn run_agent_command(
         laziness_debug_log: None,
         storage_mode: None,
     });
-    let agent_memory_config = agent_config.memory_config.clone();
+    let agent_memory_config = if hard_budget_armed {
+        None
+    } else {
+        agent_config.memory_config.clone()
+    };
     let leader_eligible = matches!(
         &agent_args.mode,
         None | Some(AgentCmd::Stdio) | Some(AgentCmd::Headless(_))
     );
     let requested_confinement = xai_grok_sandbox::requested_confinement_profile();
     let LeaderMode {
-        use_leader,
+        mut use_leader,
         policy_disable_reason,
         disabled_by_confinement,
     } = resolve_leader_mode(
@@ -1189,6 +1227,9 @@ async fn run_agent_command(
         leader_eligible,
         requested_confinement,
     );
+    if hard_budget_armed {
+        use_leader = false;
+    }
     tracing::info!(
         use_leader,
         ?policy_disable_reason,
@@ -1203,12 +1244,14 @@ async fn run_agent_command(
         std::env::current_exe().ok(),
         &xai_grok_shell::util::grok_home::grok_home(),
     );
-    if stdio_auto_update_enabled(
-        is_stdio,
-        use_leader,
-        should_check_for_updates(no_auto_update),
-        managed_install,
-    ) {
+    if !hard_budget_armed
+        && stdio_auto_update_enabled(
+            is_stdio,
+            use_leader,
+            should_check_for_updates(no_auto_update),
+            managed_install,
+        )
+    {
         let update_config = update_config.clone();
         tokio::spawn(async move {
             auto_update::run_update_if_available(
@@ -1820,16 +1863,32 @@ fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     }
     true
 }
+
+fn hard_budget_invocation_allowed(args: &PagerArgs) -> bool {
+    matches!(
+        &args.command,
+        Some(Command::Agent(agent_args))
+            if matches!(agent_args.mode, Some(AgentCmd::Stdio))
+    )
+}
+
 fn main() {
+    let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
     xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
     xai_grok_telemetry::startup::mark_process_start();
-    if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
-        std::process::exit(code);
-    }
-    if let Some(code) = xai_grok_pager::voice::maybe_run_capture_subprocess() {
-        std::process::exit(code);
+    if !hard_budget_armed {
+        if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
+            std::process::exit(code);
+        }
+        if let Some(code) = xai_grok_pager::voice::maybe_run_capture_subprocess() {
+            std::process::exit(code);
+        }
     }
     let args = PagerArgs::parse_cli();
+    if hard_budget_armed && !hard_budget_invocation_allowed(&args) {
+        eprintln!("Error: the GrokBuild hard-token budget requires `grok agent stdio`");
+        std::process::exit(2);
+    }
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
         return;
     }
@@ -1843,7 +1902,9 @@ fn main() {
     }
     #[cfg(all(feature = "jemalloc", unix))]
     install_heap_profile_hooks();
-    xai_grok_pager::memory_trace::start(xai_grok_pager::memory_trace::default_dir());
+    if !hard_budget_armed {
+        xai_grok_pager::memory_trace::start(xai_grok_pager::memory_trace::default_dir());
+    }
     raise_fd_limit();
     if let Err(e) = xai_grok_config::validate_requirements() {
         eprintln!("Couldn't start Grok: {e}");
@@ -1854,15 +1915,23 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let _sentry_guard = xai_grok_telemetry::sentry::init(xai_grok_telemetry::sentry::Config {
-        client: "grok-pager",
-        client_version: PAGER_CLIENT_VERSION,
-        release: env!("VERSION_WITH_COMMIT"),
-        disabled: xai_grok_shell::agent::config::is_error_reporting_disabled_sync(),
-    });
-    xai_grok_pager::docs::extract_user_guide_docs(&xai_grok_shell::util::grok_home::grok_home());
+    let _sentry_guard = if hard_budget_armed {
+        None
+    } else {
+        Some(xai_grok_telemetry::sentry::init(
+            xai_grok_telemetry::sentry::Config {
+                client: "grok-pager",
+                client_version: PAGER_CLIENT_VERSION,
+                release: env!("VERSION_WITH_COMMIT"),
+                disabled: xai_grok_shell::agent::config::is_error_reporting_disabled_sync(),
+            },
+        ))
+    };
+    if !hard_budget_armed {
+        xai_grok_pager::docs::extract_user_guide_docs(&xai_grok_shell::util::grok_home::grok_home());
+    }
     xai_crash_handler::install_terminal_restore_only();
-    if xai_grok_shell::util::config::load_crash_handler_enabled_sync() {
+    if !hard_budget_armed && xai_grok_shell::util::config::load_crash_handler_enabled_sync() {
         let crash_dir = xai_grok_shell::util::grok_home::grok_home().join("crash");
         if let Some(report) = xai_crash_handler::check_previous_crash(&crash_dir) {
             eprintln!("Grok crashed during your last session.");
@@ -1881,7 +1950,11 @@ fn main() {
             );
         }
     }
-    let crashed = xai_grok_active_sessions::collect_crashed().unwrap_or_default();
+    let crashed = if hard_budget_armed {
+        Vec::new()
+    } else {
+        xai_grok_active_sessions::collect_crashed().unwrap_or_default()
+    };
     if !crashed.is_empty() {
         tracing::info!(
             count = crashed.len(),
@@ -2635,6 +2708,31 @@ mod tests {
             subcommand.command,
             Some(Command::Version { json: false })
         ));
+    }
+
+    #[test]
+    fn hard_budget_accepts_only_agent_stdio_mode() {
+        assert!(require_hard_budget_stdio(false, false).is_ok());
+        assert!(require_hard_budget_stdio(false, true).is_ok());
+        assert!(require_hard_budget_stdio(true, true).is_ok());
+        let error = require_hard_budget_stdio(true, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the GrokBuild hard-token budget requires `grok agent stdio`"
+        );
+    }
+
+    #[test]
+    fn hard_budget_top_level_dispatch_accepts_only_agent_stdio() {
+        let stdio = PagerArgs::try_parse_from(["grok", "agent", "stdio"]).unwrap();
+        assert!(hard_budget_invocation_allowed(&stdio));
+
+        let ordinary = PagerArgs::try_parse_from(["grok"]).unwrap();
+        assert!(!hard_budget_invocation_allowed(&ordinary));
+        let version = PagerArgs::try_parse_from(["grok", "--version"]).unwrap();
+        assert!(!hard_budget_invocation_allowed(&version));
+        let headless = PagerArgs::try_parse_from(["grok", "agent", "headless"]).unwrap();
+        assert!(!hard_budget_invocation_allowed(&headless));
     }
     #[cfg(all(feature = "jemalloc", unix))]
     struct TempHeapDump(std::path::PathBuf);

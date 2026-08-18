@@ -506,6 +506,24 @@ fn build_offload_notice_reports_bytes_marker_and_path() {
     assert!(notice.contains("read_file"));
 }
 
+/// The Slice 4A armed path must preserve the packet bytes in-band: no prompt
+/// file, no model-visible path, and no post-allocation filesystem expansion.
+#[test]
+fn hard_budget_never_offloads_even_an_oversized_prompt() {
+    assert!(
+        !should_offload_large_prompt(false, true),
+        "armed packet must not be converted into a file-backed prompt"
+    );
+    assert!(
+        !should_offload_large_prompt(true, false),
+        "verbatim prompts retain their existing no-offload contract"
+    );
+    assert!(
+        should_offload_large_prompt(false, false),
+        "ordinary non-verbatim sessions retain large-prompt offload"
+    );
+}
+
 // ── Method gate + call-site wiring (hermetic) ───────────────────────────
 //
 // `grok_home()` is a process-wide `OnceLock`, so the real async method is

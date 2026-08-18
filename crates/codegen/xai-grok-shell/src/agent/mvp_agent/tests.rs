@@ -5738,6 +5738,52 @@ fn interactive_trust_prompt_no_request_without_capability() {
         );
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn hard_budget_disables_interactive_folder_trust_before_client_request() {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvGuard::set("GROK_HOME", home.path());
+    let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
+    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+    let _armed = EnvGuard::set(
+        xai_grok_tools::util::HARD_BUDGET_LEDGER_ENV,
+        home.path().join("authority/ledger.json"),
+    );
+    let repo = repo_with_project_mcp_server();
+    let repo_path = repo.path().to_path_buf();
+    let remote = folder_trust_on();
+    run_local_for_bridge_test(|| async {
+        let (agent, mut gw_rx) = build_agent_with_gateway_rx();
+        agent.interactive_trust_client.set(true);
+        crate::agent::folder_trust::resolve_and_record(&repo_path, Some(&remote), false);
+        let sid = acp::SessionId::new("sess-hard-budget-no-trust");
+        let (mut handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        handle.info.cwd = repo_path.to_string_lossy().to_string();
+        agent.insert_resident(&sid, handle);
+
+        agent.maybe_spawn_interactive_trust_prompt(&sid, &repo_path, Some(&remote));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), gw_rx.recv())
+                .await
+                .is_err(),
+            "armed mode must not ask the ACP client to grant folder trust"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), cmd_rx.recv())
+                .await
+                .is_err(),
+            "armed mode must not queue MCP, plugin, or hook reloads"
+        );
+        assert!(
+            !crate::agent::folder_trust::project_scope_allowed(&repo_path),
+            "armed mode must leave the workspace untrusted"
+        );
+    });
+}
+
 #[test]
 #[serial_test::serial]
 fn interactive_trust_prompt_client_error_fails_closed() {

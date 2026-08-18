@@ -100,6 +100,13 @@ impl MvpAgent {
         cwd: &std::path::Path,
         remote: Option<&crate::util::config::RemoteSettings>,
     ) {
+        // Folder trust is an ordinary-mode UX that can deliberately re-enable
+        // project MCP servers, plugins, and hooks. An armed process promises
+        // those surfaces stay disabled for its entire lifetime, so it must not
+        // ask the client for a grant that the process is forbidden to honor.
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return;
+        }
         if !self.interactive_trust_client.get() {
             return;
         }

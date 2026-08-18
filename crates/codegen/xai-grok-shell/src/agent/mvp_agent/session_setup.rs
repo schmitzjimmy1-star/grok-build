@@ -180,7 +180,9 @@ impl MvpAgent {
         let cwd = AbsPathBuf::new(cwd.to_path_buf())
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
-        folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
+        if !xai_grok_tools::util::hard_budget_environment_present() {
+            folder_trust::resolve_and_record(cwd.as_path(), remote_settings.as_ref(), false);
+        }
         let (initial_client_mcp_servers, mcp_servers) = self
             .resolve_mcp_servers(client_mcp_servers, cwd.as_path())
             .await;
@@ -199,6 +201,9 @@ impl MvpAgent {
         session_id: &acp::SessionId,
         session_info: &crate::session::info::Info,
     ) -> Option<crate::relay::RelaySync> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return None;
+        }
         let sync = self.create_relay_sync(&session_id.0, session_info)?;
         Self::spawn_relay_state_forwarder(
             sync.subscribe_state(),
@@ -211,6 +216,9 @@ impl MvpAgent {
     fn registry_title_sync(
         &self,
     ) -> Option<crate::session::persistence::RegistryGeneratedTitleSync> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return None;
+        }
         self.session_registry_client().map(|client| {
             crate::session::persistence::RegistryGeneratedTitleSync {
                 client,
@@ -233,7 +241,9 @@ impl MvpAgent {
             acp::Error::invalid_params().data("initialize must be called before new_session")
         })?;
         self.seed_client_config_auth_if_available();
-        self.spawn_settings_reapply();
+        if !xai_grok_tools::util::hard_budget_environment_present() {
+            self.spawn_settings_reapply();
+        }
         let SessionWorkspace {
             cwd,
             remote_settings,
@@ -719,18 +729,20 @@ impl MvpAgent {
         let mut load_timer = crate::instrumentation_timer!("session.load_session");
         load_timer.with_field("session_id", session_id.0.as_ref());
         load_timer.with_field("cwd", cwd.as_str());
-        let git_root =
-            xai_grok_workspace::session::git::find_git_root_from_path(cwd.as_path()).ok();
-        if let Some(root) = git_root {
+        let session_info = begin_session(&session_id, &cwd);
+        if !xai_grok_tools::util::hard_budget_environment_present() {
+            let git_root =
+                xai_grok_workspace::session::git::find_git_root_from_path(cwd.as_path()).ok();
+            if let Some(root) = git_root {
+                tokio::task::spawn_blocking(move || {
+                    crate::session::worktree_pool::cleanup_stale_pool_worktrees(Some(&root));
+                });
+            }
+            let current_session_dir = crate::session::persistence::session_dir(&session_info);
             tokio::task::spawn_blocking(move || {
-                crate::session::worktree_pool::cleanup_stale_pool_worktrees(Some(&root));
+                crate::session::persistence::cleanup_stale_sessions(Some(&current_session_dir));
             });
         }
-        let session_info = begin_session(&session_id, &cwd);
-        let current_session_dir = crate::session::persistence::session_dir(&session_info);
-        tokio::task::spawn_blocking(move || {
-            crate::session::persistence::cleanup_stale_sessions(Some(&current_session_dir));
-        });
         let session_exists = self.is_resident(&session_id);
         let no_replay = policy.no_replay;
         if session_exists {
@@ -831,7 +843,13 @@ impl MvpAgent {
         #[allow(unused_variables)]
         let session_computer_sessions = resolve_session_computer_sessions(request_meta.as_ref())?;
         let code_restore_info = self
-            .restore_session_code(&session_id, &cwd, &summary, policy.restore_code)
+            .restore_session_code(
+                &session_id,
+                &cwd,
+                &summary,
+                policy.restore_code
+                    && !xai_grok_tools::util::hard_budget_environment_present(),
+            )
             .await;
         let load_envrc = {
             let skip_envrc = request_meta
@@ -845,7 +863,12 @@ impl MvpAgent {
                 self.cfg.borrow().session.load_envrc.unwrap_or(true)
             }
         };
-        let envrc = if !load_envrc {
+        let envrc = if xai_grok_tools::util::hard_budget_environment_present() {
+            Some(xai_grok_workspace::envrc::spawn_envrc_load(
+                cwd.as_path().to_path_buf(),
+                false,
+            ))
+        } else if !load_envrc {
             Some(xai_grok_workspace::envrc::spawn_envrc_load(
                 cwd.as_path().to_path_buf(),
                 false,
@@ -970,7 +993,9 @@ impl MvpAgent {
                 );
             }
         }
-        if let Some(hooks) = crate::extensions::hooks::reconnect_client_hooks(request_meta.as_ref())
+        if !xai_grok_tools::util::hard_budget_environment_present()
+            && let Some(hooks) =
+                crate::extensions::hooks::reconnect_client_hooks(request_meta.as_ref())
             && let Some(handle) = self.resident_handle(&session_id)
         {
             handle.set_client_hooks(hooks);

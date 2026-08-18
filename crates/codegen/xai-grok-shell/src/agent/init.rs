@@ -23,15 +23,20 @@ pub fn bootstrap(
     auth_manager: &Arc<AuthManager>,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> Result<(AgentConfig, ModelsManager), String> {
+    let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
     // Remote kill-switch before the gate (settings-only prefetch — no managed-config
     // sync, so a live server cannot heal a tampered policy before fail-closed).
     xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::Bootstrap);
     let mut cfg = cfg.clone();
-    {
+    if !hard_budget_armed {
         let _timer = crate::instrumentation_timer!("startup.bootstrap.remote_settings");
         ensure_remote_settings_side_effects(&mut cfg, false);
     }
-    crate::managed_config::managed_policy_gate()?;
+    if hard_budget_armed {
+        crate::managed_config::managed_policy_gate_read_only()?;
+    } else {
+        crate::managed_config::managed_policy_gate()?;
+    }
     let cfg = {
         let _timer = crate::instrumentation_timer!("startup.bootstrap.resolve_config");
         let cfg = resolve_config(&cfg, auth_manager);
@@ -50,7 +55,9 @@ pub fn bootstrap(
 
     // Refresh on every auth refresh — the FSEvents watcher can silently die after
     // macOS sleep, stranding the catalog on bundled defaults.
-    models_manager.start_auth_refresh_watcher(auth_manager.refresh_notifier());
+    if !hard_budget_armed {
+        models_manager.start_auth_refresh_watcher(auth_manager.refresh_notifier());
+    }
 
     Ok((cfg, models_manager))
 }
@@ -72,6 +79,9 @@ pub(crate) fn exit_on_config_error<T>(e: String) -> T {
 /// `sync_managed`: when true, missing-settings fallback may also refresh
 /// managed-config. Must be false before the managed-policy gate.
 fn ensure_remote_settings_side_effects(cfg: &mut AgentConfig, sync_managed: bool) {
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        return;
+    }
     // Fallback: if the client didn't pre-supply remote settings, fetch them
     // now so remote-settings-gated features work regardless of which client
     // spawned us. Clients that already call `start_early_prefetch()` and
@@ -164,6 +174,13 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
         xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
         let limits = crate::util::limits::ProcessLimits::read();
         limits.log();
+
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            // Armed stdio is an intentionally inert host around the sampler
+            // governor. Do not extract/purge files, start config sync, or
+            // initialize any telemetry/upload client before ACP containment.
+            return;
+        }
 
         if !cfg!(test) {
             // Clear a logged-out team's files before the background sync runs.

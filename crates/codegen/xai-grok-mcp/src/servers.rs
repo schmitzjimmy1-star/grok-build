@@ -496,6 +496,10 @@ impl McpState {
         servers: Vec<AcpServerEntry>,
         invoker: Arc<dyn crate::acp_transport::AcpReverseInvoker>,
     ) {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            self.acp_mcp = None;
+            return;
+        }
         self.acp_mcp = Some(AcpMcpRegistry { servers, invoker });
     }
 
@@ -538,6 +542,9 @@ impl McpState {
         &self,
         overrides: &HashMap<String, McpClientTimeoutOverrides>,
     ) -> Vec<McpClient> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Vec::new();
+        }
         let Some(acp) = &self.acp_mcp else {
             return Vec::new();
         };
@@ -1394,6 +1401,12 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         raw: serde_json::Value,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "hard_budget_mcp_disabled",
+                "MCP execution is disabled while the hard-token budget is armed",
+            ));
+        }
         let mcp_call_start = std::time::Instant::now();
         let (client, event_writer) = {
             let state = self.tool.mcp_state.lock().await;
@@ -4177,6 +4190,11 @@ pub async fn start_mcp_server(
     byo_config: Option<&McpOAuthConfig>,
     ctx: &McpSpawnCtx<'_>,
 ) -> Result<McpClient, McpError> {
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        return Err(McpError::ClientError(
+            "MCP startup is disabled while the hard-token budget is armed".to_string(),
+        ));
+    }
     let _per_server_timer = xai_grok_telemetry::instrumentation::timer("mcp_start_one_server");
     match mcp_server {
         acp::McpServer::Stdio(acp::McpServerStdio {

@@ -25,6 +25,73 @@ fn tool_overrides_capability() -> serde_json::Value {
     serde_json::to_value(TOOL_OVERRIDES_CAPABILITY)
         .expect("ToolOverridesCapability is always serializable")
 }
+
+fn initialize_agent_capabilities_meta(hard_budget_armed: bool) -> acp::Meta {
+    let mut meta = serde_json::json!({
+        "x.ai/fs_notify": !hard_budget_armed,
+        "x.ai/capabilities": if hard_budget_armed {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({
+                "toolOverrides": tool_overrides_capability(),
+            })
+        },
+        (crate::extensions::grokbuild_budget::CAPABILITY_KEY):
+            crate::extensions::grokbuild_budget::capability_value(),
+    })
+    .as_object()
+    .cloned()
+    .expect("initialize capability metadata is an object");
+    if !hard_budget_armed {
+        meta.insert(
+            "x.ai/hooks".to_owned(),
+            serde_json::json!({
+                "blockingEvents": crate::extensions::hooks::ADVERTISED_BLOCKING_EVENTS,
+                "decisions": crate::extensions::hooks::ADVERTISED_DECISIONS,
+                "stopSignals": crate::extensions::hooks::ADVERTISED_STOP_SIGNALS,
+            }),
+        );
+    }
+    meta
+}
+
+/// The armed acceptance runtime is intentionally a tiny ACP control plane.
+/// Everything else is rejected before request parsing so cloud, process,
+/// filesystem, plugin, MCP, and auxiliary-inference handlers cannot perform
+/// side effects behind the sampler governor.
+fn hard_budget_allows_ext_method(method: &str) -> bool {
+    matches!(
+        method,
+        crate::extensions::grokbuild_budget::METHOD
+            | crate::extensions::grokbuild_budget::RECEIPTS_METHOD
+            | "x.ai/session/info"
+            | "x.ai/session/usage"
+            | "x.ai/session/updates"
+            | "x.ai/task/list"
+            | "x.ai/task/kill"
+            | "x.ai/subagent/get"
+            | "x.ai/subagent/list_running"
+            | "x.ai/subagent/cancel"
+    )
+}
+
+fn hard_budget_prompt_sha256(
+    prompt: &[acp::ContentBlock],
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<String, &'static str> {
+    use sha2::{Digest, Sha256};
+
+    if meta.is_some_and(|value| !value.is_empty()) {
+        return Err("armed prompt metadata is disabled");
+    }
+    let [acp::ContentBlock::Text(text)] = prompt else {
+        return Err("armed prompt must contain exactly one text block");
+    };
+    if text.text.trim_start().starts_with('/') {
+        return Err("slash-command expansion is disabled while the hard-token budget is armed");
+    }
+    Ok(format!("{:x}", Sha256::digest(text.text.as_bytes())))
+}
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -47,8 +114,9 @@ impl acp::Agent for MvpAgent {
         tracing::debug!(target: "sampling_log", "Received initialize request");
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
         xai_grok_telemetry::startup::mark_agent_serving();
+        let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
         self.start_subagent_coordinator();
-        if self.cfg.borrow().remote_settings.is_none() {
+        if !hard_budget_armed && self.cfg.borrow().remote_settings.is_none() {
             self.spawn_settings_reapply();
         }
         let remote_settled = self.remote_settings_settled();
@@ -58,24 +126,24 @@ impl acp::Agent for MvpAgent {
                 "auto worktree gc and session search deferred until remote_settings arrive"
             );
         }
-        let grok_home = xai_fast_worktree::resolve_grok_home();
-        tokio::task::spawn_blocking(move || {
-            crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
-            if !remote_settled {
-                return;
+        if !hard_budget_armed {
+            let grok_home = xai_fast_worktree::resolve_grok_home();
+            tokio::task::spawn_blocking(move || {
+                crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
+                if !remote_settled {
+                    return;
+                }
+                Self::reclaim_worktrees(grok_home, auto_gc_policy);
+            });
+            tokio::task::spawn_blocking(|| {
+                crate::session::persistence::cleanup_stale_sessions(None);
+            });
+            if remote_settled {
+                self.start_search_index_once();
             }
-            Self::reclaim_worktrees(grok_home, auto_gc_policy);
-        });
-        tokio::task::spawn_blocking(|| {
-            crate::session::persistence::cleanup_stale_sessions(None);
-        });
-        if remote_settled {
-            self.start_search_index_once();
-        }
-        const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
-        static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
-        CLEANUP_PERMISSIONS_ONCE
-            .call_once(|| {
+            const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
+            static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
+            CLEANUP_PERMISSIONS_ONCE.call_once(|| {
                 tokio::task::spawn(
                     xai_grok_workspace::permission::cleanup_stale_permission_state(
                         std::time::Duration::from_secs(
@@ -84,8 +152,9 @@ impl acp::Agent for MvpAgent {
                     ),
                 );
             });
-        xai_grok_workspace::trust::migrate_legacy_hook_trust();
-        if let Some(auth) = self.auth_manager.current() {
+            xai_grok_workspace::trust::migrate_legacy_hook_trust();
+        }
+        if !hard_budget_armed && let Some(auth) = self.auth_manager.current() {
             let user_id = auth.user_id.trim();
             let needs_user_info = user_id.is_empty()
                 || user_id.eq_ignore_ascii_case("unknown");
@@ -108,10 +177,15 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
-        if !self.tier_allowed.get() && let Some(auth) = self.auth_manager.current() {
+        if !hard_budget_armed
+            && !self.tier_allowed.get()
+            && let Some(auth) = self.auth_manager.current()
+        {
             self.enforce_grok_code_access(&auth).await;
         }
-        self.maybe_sync_bundle_in_background(false);
+        if !hard_budget_armed {
+            self.maybe_sync_bundle_in_background(false);
+        }
         let mut client_type = arguments
             .meta
             .as_ref()
@@ -269,7 +343,12 @@ impl acp::Agent for MvpAgent {
             .models()
             .values()
             .any(crate::agent::config::ModelEntry::has_own_credentials);
-        let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
+        let first_party_env_ok = if hard_budget_armed {
+            // Armed acceptance must never turn initialize into an unbudgeted
+            // network probe. The sampler will validate the materialized route
+            // credential when the governed request is built.
+            true
+        } else if crate::auth::should_probe_first_party_env_key(
             disable_api_key_auth,
             has_byok,
             auth_method::has_xai_api_key_env(),
@@ -302,7 +381,7 @@ impl acp::Agent for MvpAgent {
             ),
         );
         let mut has_cached_token = init_has_current;
-        if !init_has_current && init_is_expired {
+        if !hard_budget_armed && !init_has_current && init_is_expired {
             has_cached_token = match self.auth_manager.silent_refresh().await {
                 SilentRefresh::Renewed(_) => true,
                 SilentRefresh::Failed(remedy) => remedy.is_self_healing(),
@@ -363,7 +442,25 @@ impl acp::Agent for MvpAgent {
             has_auth_provider_command: has_auth_provider,
             preferred_method,
         });
-        let auth_methods = built.methods;
+        // Interactive authentication and helper-backed refresh are forbidden
+        // for an armed process. A governed process starts with an already
+        // materialized credential and advertises no authentication action.
+        let auth_methods = if hard_budget_armed {
+            Vec::new()
+        } else {
+            built.methods
+        };
+        let default_auth_method_id = if hard_budget_armed {
+            // Internal, non-interactive identity only. It is deliberately not
+            // advertised to the ACP client and cannot be selected through
+            // `authenticate`; it lets a session use the already-materialized
+            // route credential without opening any refresh/login path.
+            Some(acp::AuthMethodId::new(
+                "com.grokbuild.hard-budget-materialized",
+            ))
+        } else {
+            built.default_auth_method_id
+        };
         xai_grok_telemetry::unified_log::info(
             "auth: initialize() built auth_methods for ACP response",
             None,
@@ -380,12 +477,13 @@ impl acp::Agent for MvpAgent {
                 "init_is_expired": init_is_expired,
                 "auth_mode": self.auth_manager.current().map(|a| format!("{:?}", a.auth_mode)),
                 "methods": auth_methods.iter().map(|m| m.id().0.as_ref()).collect::<Vec<_>>(),
-                "default_auth_method_id": built.default_auth_method_id.as_ref().map(|id| id.0.as_ref()),
+                "default_auth_method_id": default_auth_method_id.as_ref().map(|id| id.0.as_ref()),
             }),
             ),
         );
         debug_assert!(
-            !has_external_api_key
+            hard_budget_armed
+                || !has_external_api_key
                 || matches!(
                     auth_methods
                         .first()
@@ -396,11 +494,14 @@ impl acp::Agent for MvpAgent {
              when has_external_api_key is true; got {:?}",
             auth_methods.first().map(|m| m.id()),
         );
-        let default_auth_method_id_wire: Option<String> = built
-            .default_auth_method_id
-            .as_ref()
-            .map(|id| id.0.to_string());
-        if let Some(default_id) = built.default_auth_method_id {
+        let default_auth_method_id_wire: Option<String> = if hard_budget_armed {
+            None
+        } else {
+            default_auth_method_id
+                .as_ref()
+                .map(|id| id.0.to_string())
+        };
+        if let Some(default_id) = default_auth_method_id {
             xai_grok_telemetry::unified_log::info(
                 "auth method selection",
                 None,
@@ -420,59 +521,55 @@ impl acp::Agent for MvpAgent {
         let current_working_directory = self.launch_cwd.clone();
         let hostname = gethostname::gethostname();
         let mcp_servers: Vec<crate::extensions::mcp::McpServerEntry> = Vec::new();
-        self.spawn_initialize_launch_mcp_setup();
-        self.spawn_managed_gateway_tool_catalog_fetch();
-        {
-            let agent_ref = LocalRef::new(self);
-            tokio::task::spawn_local(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                agent_ref.get().emit_announcements(AnnouncementsPushMode::SeedNewClient);
-            });
+        if !hard_budget_armed {
+            self.spawn_initialize_launch_mcp_setup();
+            self.spawn_managed_gateway_tool_catalog_fetch();
+            {
+                let agent_ref = LocalRef::new(self);
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    agent_ref.get().emit_announcements(AnnouncementsPushMode::SeedNewClient);
+                });
+            }
+            self.spawn_announcements_refresh();
         }
-        self.spawn_announcements_refresh();
-        self.spawn_heap_profile_monitor();
-        let init_model_state = if crate::agent::chat_modes::process_chat_mode_enabled() {
+        if !hard_budget_armed {
+            self.spawn_heap_profile_monitor();
+        }
+        let init_model_state = if !hard_budget_armed
+            && crate::agent::chat_modes::process_chat_mode_enabled()
+        {
             self.chat_modes.model_state().await
         } else {
             self.model_state(None)
         };
         let session_capabilities = acp::SessionCapabilities::new()
             .close(acp::SessionCloseCapabilities::new());
-        let session_capabilities = if crate::agent::chat_modes::process_chat_mode_enabled() {
+        let session_capabilities = if hard_budget_armed
+            || crate::agent::chat_modes::process_chat_mode_enabled()
+        {
             session_capabilities
         } else {
             session_capabilities
                     .list(acp::SessionListCapabilities::new())
                     .resume(acp::SessionResumeCapabilities::new())
         };
+        let agent_capabilities_meta =
+            initialize_agent_capabilities_meta(hard_budget_armed);
         Ok(
             acp::InitializeResponse::new(acp::ProtocolVersion::V1)
                 .agent_capabilities(
                     acp::AgentCapabilities::new()
                         .load_session(true)
-                        .meta(
-                            serde_json::json!({
-                    "x.ai/fs_notify": true,
-                    // Advertised so SDKs can warn when a registration depends on
-                    // hook behavior this agent doesn't honor.
-                    "x.ai/hooks": {
-                        "blockingEvents": crate::extensions::hooks::ADVERTISED_BLOCKING_EVENTS,
-                        "decisions": crate::extensions::hooks::ADVERTISED_DECISIONS,
-                        "stopSignals": crate::extensions::hooks::ADVERTISED_STOP_SIGNALS,
-                    },
-                    "x.ai/capabilities": {
-                        "toolOverrides": tool_overrides_capability(),
-                    },
-                })
-                                .as_object()
-                                .cloned(),
-                        )
+                        .meta(Some(agent_capabilities_meta))
                         .prompt_capabilities(
                             acp::PromptCapabilities::new().embedded_context(true),
                         )
-                        .mcp_capabilities(
-                            acp::McpCapabilities::new().http(true).sse(true),
-                        )
+                        .mcp_capabilities(if hard_budget_armed {
+                            acp::McpCapabilities::new()
+                        } else {
+                            acp::McpCapabilities::new().http(true).sse(true)
+                        })
                         .session_capabilities(session_capabilities),
                 )
                 .auth_methods(auth_methods)
@@ -485,10 +582,10 @@ impl acp::Agent for MvpAgent {
                     "defaultAuthMethodId": default_auth_method_id_wire,
                     // The agent can drive in-process SDK MCP servers over the ACP reverse
                     // channel (`x.ai/mcp/sdk_call`); the SDK reads this to enable transport="acp".
-                    (xai_grok_mcp::wire::MCP_SDK): true,
+                    (xai_grok_mcp::wire::MCP_SDK): !hard_budget_armed,
                     // `session/new` / `session/load` accept per-session plugin roots in
                     // `_meta.pluginDirs`; the SDKs gate `GrokOptions.plugins` on this.
-                    (SESSION_PLUGIN_DIRS_CAPABILITY_KEY): true,
+                    (SESSION_PLUGIN_DIRS_CAPABILITY_KEY): !hard_budget_armed,
                     "currentWorkingDirectory": current_working_directory.to_string_lossy().to_string(),
                     "agentVersion": xai_grok_version::VERSION,
                     "agentId": agent_id(),
@@ -496,9 +593,13 @@ impl acp::Agent for MvpAgent {
                     "hostname": hostname.to_string_lossy().to_string(),
                     "modelState": init_model_state,
                     "mcpServers": mcp_servers,
-                    "mcpApps": client_supports_mcp_apps,
+                    "mcpApps": client_supports_mcp_apps && !hard_budget_armed,
                     "metadata": metadata,
-                    "availableCommands": crate::session::slash_commands::builtin_commands(self.command_availability()),
+                    "availableCommands": if hard_budget_armed {
+                        Vec::<acp::AvailableCommand>::new()
+                    } else {
+                        crate::session::slash_commands::builtin_commands(self.command_availability())
+                    },
                     "cancelRewind": self
                         .cfg
                         .borrow()
@@ -507,8 +608,8 @@ impl acp::Agent for MvpAgent {
                     // default ON). The client gates BOTH its automatic
                     // away-recap poll and the manual `/recap` on this so a
                     // disabled feature produces zero `x.ai/recap` traffic.
-                    "sessionRecap": self.cfg.borrow().is_session_recap_enabled(),
-                    "voiceMode": self.cfg.borrow().is_voice_mode_enabled(),
+                    "sessionRecap": !hard_budget_armed && self.cfg.borrow().is_session_recap_enabled(),
+                    "voiceMode": !hard_budget_armed && self.cfg.borrow().is_voice_mode_enabled(),
                 })
                         .as_object()
                         .cloned()
@@ -519,6 +620,11 @@ impl acp::Agent for MvpAgent {
         &self,
         arguments: acp::AuthenticateRequest,
     ) -> Result<AuthenticateResponse, acp::Error> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(acp::Error::invalid_request().data(
+                "authentication is disabled while the GrokBuild hard-token budget is armed",
+            ));
+        }
         tracing::info!(method = %arguments.method_id.0, "auth: authenticate request");
         xai_grok_telemetry::unified_log::info(
             "auth started",
@@ -931,12 +1037,22 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::ListSessionsRequest,
     ) -> Result<acp::ListSessionsResponse, acp::Error> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(acp::Error::invalid_request().data(
+                "session/list is disabled while the GrokBuild hard-token budget is armed",
+            ));
+        }
         crate::agent::handlers::session::handle_list_sessions(self, args).await
     }
     async fn resume_session(
         &self,
         args: acp::ResumeSessionRequest,
     ) -> Result<acp::ResumeSessionResponse, acp::Error> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(acp::Error::invalid_request().data(
+                "session/resume is disabled while the GrokBuild hard-token budget is armed; use session/load",
+            ));
+        }
         self.resume_session_inner(args).await
     }
     async fn close_session(
@@ -975,6 +1091,28 @@ impl acp::Agent for MvpAgent {
             .session_handle_waiting_for_load(&arguments.session_id)
             .await
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            let prompt_sha256 = hard_budget_prompt_sha256(&arguments.prompt, arguments.meta.as_ref())
+                .map_err(|message| acp::Error::invalid_request().data(message))?;
+            let budget = xai_grok_sampler::HardTokenBudget::from_env()
+                .map_err(|_| {
+                    acp::Error::invalid_request().data("hard-token budget configuration is invalid")
+                })?
+                .ok_or_else(|| {
+                    acp::Error::invalid_request().data("hard-token budget is not armed")
+                })?;
+            let allocation = budget.allocation_contract().ok_or_else(|| {
+                acp::Error::invalid_request().data("hard-token budget allocation is unavailable")
+            })?;
+            if prompt_sha256 != allocation.prompt_sha256 {
+                return Err(acp::Error::invalid_request()
+                    .data("prompt does not match the immutable hard-token budget allocation"));
+            }
+            if self.hard_budget_prompt_claimed.replace(true) {
+                return Err(acp::Error::invalid_request()
+                    .data("hard-token budget allocation already claimed by a prompt"));
+            }
+        }
         if self.models_manager.allowlist_excludes_all() {
             self.send_model_auto_switched(
                     &arguments.session_id,
@@ -1090,7 +1228,11 @@ impl acp::Agent for MvpAgent {
         let turn_number = self.allocate_turn_number(&arguments.session_id);
         tracing::Span::current().record("turn_number", turn_number);
         tracing::info!("Setting up prompt tracing");
-        let trace_context = self.get_trace_context(&handle.info, turn_number).await;
+        let trace_context = if xai_grok_tools::util::hard_budget_environment_present() {
+            None
+        } else {
+            self.get_trace_context(&handle.info, turn_number).await
+        };
         let (harness_block_for_upload, upload_flush_timeout) = crate::util::config::load_blocking_upload_config_sync();
         let block_for_upload = self.cfg.borrow().mode == config::AgentMode::Headless
             || harness_block_for_upload;
@@ -2186,6 +2328,13 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::ExtRequest,
     ) -> Result<acp::ExtResponse, acp::Error> {
+        if xai_grok_tools::util::hard_budget_environment_present()
+            && !hard_budget_allows_ext_method(args.method.as_ref())
+        {
+            return Err(acp::Error::invalid_request().data(
+                "ACP extension method is disabled while the hard-token budget is armed",
+            ));
+        }
         let request_meta = serde_json::from_str::<serde_json::Value>(args.params.get())
             .ok()
             .and_then(|v| v.get("_meta").cloned());
@@ -2244,6 +2393,12 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
+            crate::extensions::grokbuild_budget::METHOD => {
+                crate::extensions::grokbuild_budget::handle(&args).await
+            }
+            crate::extensions::grokbuild_budget::RECEIPTS_METHOD => {
+                crate::extensions::grokbuild_budget::handle(&args).await
+            }
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
                 crate::extensions::memory::handle(self, &args).await
             }
@@ -2573,6 +2728,13 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::ExtNotification,
     ) -> Result<(), acp::Error> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            tracing::warn!(
+                method = %args.method,
+                "ignored ACP extension notification while the hard-token budget is armed"
+            );
+            return Ok(());
+        }
         tracing::info!("Received extension notification: method={}", args.method);
         if args.method.as_ref() == "x.ai/yolo_mode_changed"
             && let Ok(params) = serde_json::from_str::<
@@ -2917,7 +3079,12 @@ impl acp::Agent for MvpAgent {
 }
 #[cfg(test)]
 mod tool_overrides_capability_tests {
-    use super::tool_overrides_capability;
+    use agent_client_protocol as acp;
+
+    use super::{
+        hard_budget_allows_ext_method, hard_budget_prompt_sha256, initialize_agent_capabilities_meta,
+        tool_overrides_capability,
+    };
     #[test]
     fn capability_wire_shape_is_pinned() {
         assert_eq!(
@@ -2929,5 +3096,77 @@ mod tool_overrides_capability_tests {
                 "x_thread_fetch": false,
             }),
         );
+    }
+
+    #[test]
+    fn hard_budget_extension_surface_is_exact_and_observational() {
+        for method in [
+            "com.grokbuild/budget/status",
+            "com.grokbuild/budget/receipts",
+            "x.ai/session/info",
+            "x.ai/session/usage",
+            "x.ai/session/updates",
+            "x.ai/task/list",
+            "x.ai/task/kill",
+            "x.ai/subagent/get",
+            "x.ai/subagent/list_running",
+            "x.ai/subagent/cancel",
+        ] {
+            assert!(hard_budget_allows_ext_method(method), "{method}");
+        }
+        for method in [
+            "x.ai/terminal/create",
+            "x.ai/terminal/pty/create",
+            "x.ai/mcp/list",
+            "x.ai/fs/write_file",
+            "x.ai/pr/status",
+            "x.ai/git/status",
+            "x.ai/session/repair",
+            "x.ai/suggest",
+            "x.ai/cloud/env/create",
+            "x.ai/billing",
+            "x.ai/plugins/reload",
+            "x.ai/scheduler/delete",
+        ] {
+            assert!(!hard_budget_allows_ext_method(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn armed_initialize_metadata_does_not_advertise_disabled_surfaces() {
+        let meta = initialize_agent_capabilities_meta(true);
+        assert_eq!(meta.get("x.ai/fs_notify"), Some(&serde_json::json!(false)));
+        assert!(!meta.contains_key("x.ai/hooks"));
+        assert_eq!(meta.get("x.ai/capabilities"), Some(&serde_json::json!({})));
+
+        let ordinary = initialize_agent_capabilities_meta(false);
+        assert_eq!(ordinary.get("x.ai/fs_notify"), Some(&serde_json::json!(true)));
+        assert!(ordinary.contains_key("x.ai/hooks"));
+        assert!(ordinary["x.ai/capabilities"].get("toolOverrides").is_some());
+    }
+
+    #[test]
+    fn armed_prompt_digest_is_exact_text_and_rejects_expansion_or_extra_blocks() {
+        use sha2::{Digest, Sha256};
+
+        let text = "exact final payload";
+        let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+        assert_eq!(
+            hard_budget_prompt_sha256(&blocks, None).unwrap(),
+            format!("{:x}", Sha256::digest(text.as_bytes()))
+        );
+
+        let slash = vec![acp::ContentBlock::Text(acp::TextContent::new(" /fork"))];
+        assert!(hard_budget_prompt_sha256(&slash, None).is_err());
+        let extra = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("one")),
+            acp::ContentBlock::Text(acp::TextContent::new("two")),
+        ];
+        assert!(hard_budget_prompt_sha256(&extra, None).is_err());
+        let meta = serde_json::Map::from_iter([(
+            "outputSchema".into(),
+            serde_json::json!({"type":"object"}),
+        )]);
+        assert!(hard_budget_prompt_sha256(&blocks, Some(&meta)).is_err());
     }
 }

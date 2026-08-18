@@ -201,6 +201,11 @@ impl ImageGenClient {
         prompt: &str,
         aspect_ratio: &str,
     ) -> Result<Vec<u8>, xai_tool_runtime::ToolError> {
+        if hard_budget_environment_present() {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "image generation is disabled while the hard token budget is armed",
+            ));
+        }
         let url = format!("{}/images/generations", self.base_url.trim_end_matches('/'));
 
         let payload = serde_json::json!({
@@ -272,6 +277,16 @@ impl ImageGenClient {
                 ))
             })
     }
+}
+
+fn hard_budget_environment_present() -> bool {
+    [
+        "GROK_HARD_TOKEN_BUDGET_LEDGER",
+        "GROK_HARD_TOKEN_BUDGET_MANIFEST",
+        "GROK_HARD_TOKEN_BUDGET_ALLOCATION",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 /// `Enabled` means credentials are present; each tool has its own gate.

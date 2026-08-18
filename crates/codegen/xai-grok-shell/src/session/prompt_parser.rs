@@ -161,6 +161,34 @@ pub(crate) async fn parse_prompt_with_skills(
         is_cursor,
     })
 }
+
+/// Parse the single text block admitted by the hard-token-budget ACP gate.
+///
+/// Armed prompts are immutable packet inputs. Treat `@...` literally and do
+/// not consult the filesystem, embedded resources, editor state, or skills
+/// after the prompt digest has been authorized.
+pub(crate) fn parse_hard_budget_prompt(
+    prompt: &[acp::ContentBlock],
+    verbatim: bool,
+    is_cursor: bool,
+) -> Result<ParsedPrompt, acp::Error> {
+    let [acp::ContentBlock::Text(text)] = prompt else {
+        return Err(
+            acp::Error::invalid_params().data("armed prompt must contain exactly one text block")
+        );
+    };
+    Ok(ParsedPrompt {
+        context: String::new(),
+        query: if verbatim {
+            text.text.clone()
+        } else {
+            user_query(text.text.clone())
+        },
+        skill_information: String::new(),
+        images: Vec::new(),
+        is_cursor,
+    })
+}
 /// Returns `(context, query)` — the two halves of the prompt kept separate
 /// so the caller can truncate context without searching for the query boundary.
 fn render_message(
@@ -346,6 +374,24 @@ fn render_open_files(paths: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_budget_prompt_treats_absolute_at_reference_as_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("outside.txt");
+        std::fs::write(&secret, "MUST_NOT_BE_EXPANDED").unwrap();
+        let text = format!("inspect @{}", secret.display());
+        let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(text.clone()))];
+
+        let parsed = parse_hard_budget_prompt(&prompt, false, false).unwrap();
+
+        assert!(parsed.context.is_empty());
+        assert!(parsed.skill_information.is_empty());
+        assert!(parsed.images.is_empty());
+        assert!(parsed.query.contains(&text));
+        assert!(!parsed.query.contains("MUST_NOT_BE_EXPANDED"));
+    }
+
     /// Assemble a `render_message` result into a flat string for test assertions.
     fn assemble(parts: (String, String), is_cursor: bool) -> String {
         let (context, query) = parts;

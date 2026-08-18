@@ -8,6 +8,19 @@ impl SessionActor {
     ) -> PromptTurnResult {
         // Builtin turns carry no user message, so a send-now may cancel from the start.
         self.mark_front_message_committed().await;
+        if xai_grok_tools::util::hard_budget_environment_present()
+            && !matches!(
+                &action,
+                BuiltinAction::ContextInfo | BuiltinAction::SessionInfo
+            )
+        {
+            self.send_host_turn_slash_command_output(&format!(
+                "/{} is disabled while the GrokBuild hard-token budget is armed.",
+                action.command_name()
+            ))
+            .await;
+            return ok_end_turn(0, None);
+        }
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SlashCommandUsed {
             command: action.command_name().to_string(),
             args_provided: action.args_provided(),

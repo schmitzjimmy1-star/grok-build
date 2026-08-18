@@ -168,7 +168,9 @@ fn spawn_agent_local(
     let gateway = GatewaySender::new(gw_tx);
     let mut agent = MvpAgent::new(gateway, &agent_config, auth_manager, prefetched_models)
         .unwrap_or_else(exit_on_config_error);
-    agent.models_manager.spawn_background_refresh();
+    if !xai_grok_tools::util::hard_budget_environment_present() {
+        agent.models_manager.spawn_background_refresh();
+    }
     if let Some(mc) = memory_config {
         agent.set_memory_config(mc);
     }
@@ -252,6 +254,7 @@ pub async fn run_stdio_agent(
     prefetched_models: Option<IndexMap<String, ModelEntry>>,
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> anyhow::Result<()> {
+    let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
     register_fs_watch_runtime();
     if let Err(error) = xai_tty_utils::kill_current_process_on_parent_death() {
         tracing::warn!(
@@ -261,10 +264,12 @@ pub async fn run_stdio_agent(
         );
     }
     xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
-    xai_file_utils::queue::cleanup_orphaned_uploads(
-        &grok_home::grok_home(),
-        xai_file_utils::queue::DEFAULT_MAX_AGE,
-    );
+    if !hard_budget_armed {
+        xai_file_utils::queue::cleanup_orphaned_uploads(
+            &grok_home::grok_home(),
+            xai_file_utils::queue::DEFAULT_MAX_AGE,
+        );
+    }
     if let Ok(version) = std::env::var("GROK_CLIENT_VERSION") {
         crate::unified_log::info(
             "GROK_CLIENT_VERSION",
@@ -290,7 +295,11 @@ pub async fn run_stdio_agent(
         }
         let _ = stdin_closed_tx.send(());
     });
-    let _skills_watcher = spawn_skills_file_watcher(&acp_incoming_tx, &agent_config.skills.paths);
+    let _skills_watcher = if hard_budget_armed {
+        None
+    } else {
+        spawn_skills_file_watcher(&acp_incoming_tx, &agent_config.skills.paths)
+    };
     let local_set = tokio::task::LocalSet::new();
     let result = local_set
         .run_until(async move {
@@ -302,10 +311,12 @@ pub async fn run_stdio_agent(
                 let _ = tx.shutdown().await;
             });
             let auth_manager = Arc::new(agent_config.create_auth_manager());
-            auth_manager.start_proactive_refresh(tokio_util::sync::CancellationToken::new());
-            auth_manager.start_system_power_listener();
-            crate::managed_config::ensure_managed_policy_present(&auth_manager).await;
-            apply_otel_config(&auth_manager, &agent_config.grok_com_config);
+            if !hard_budget_armed {
+                auth_manager.start_proactive_refresh(tokio_util::sync::CancellationToken::new());
+                auth_manager.start_system_power_listener();
+                crate::managed_config::ensure_managed_policy_present(&auth_manager).await;
+                apply_otel_config(&auth_manager, &agent_config.grok_com_config);
+            }
             let handle_io = spawn_agent_local(
                 agent_config,
                 auth_manager,

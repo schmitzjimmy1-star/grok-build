@@ -91,6 +91,17 @@ impl SessionActor {
     ) -> xai_hooks_plugins_types::ActionOutcome {
         use xai_hooks_plugins_types::{ActionOutcome, HooksAction, OutcomeStatus};
 
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return ActionOutcome {
+                status: OutcomeStatus::Unsupported,
+                message:
+                    "Hook management is disabled while the GrokBuild hard-token budget is armed."
+                        .into(),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+
         match action {
             HooksAction::Reload => {
                 let reload_msg = self.reload_hooks_impl().await;
@@ -275,6 +286,17 @@ impl SessionActor {
         action: xai_hooks_plugins_types::PluginsAction,
     ) -> xai_hooks_plugins_types::ActionOutcome {
         use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus, PluginsAction};
+
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return ActionOutcome {
+                status: OutcomeStatus::Unsupported,
+                message:
+                    "Plugin management is disabled while the GrokBuild hard-token budget is armed."
+                        .into(),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
 
         match action {
             PluginsAction::Reload => match &self.plugin_registry_handle {
@@ -627,6 +649,13 @@ impl SessionActor {
     /// (the parent module) can invoke it after an interactive folder-trust
     /// grant — same visibility as `apply_plugin_registry_snapshot` below.
     pub(super) async fn reload_hooks_impl(self: &std::sync::Arc<Self>) -> String {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            *self.hook_registry.borrow_mut() = None;
+            self.hook_load_errors.borrow_mut().clear();
+            return "Hooks remain disabled while the GrokBuild hard-token budget is armed."
+                .to_string();
+        }
+
         let git_root = xai_grok_workspace::session::git::find_git_root_from_path(
             std::path::Path::new(&self.session_info.cwd),
         )
@@ -730,6 +759,13 @@ impl SessionActor {
         handle: &xai_grok_agent::plugins::SharedPluginRegistryHandle,
         force: bool,
     ) -> String {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            *self.plugin_registry.borrow_mut() = None;
+            *self.hook_registry.borrow_mut() = None;
+            return "Plugins remain disabled while the GrokBuild hard-token budget is armed."
+                .to_string();
+        }
+
         let session_cwd = std::path::Path::new(&self.session_info.cwd);
 
         let sid = self.session_info.id.0.as_ref();
@@ -838,6 +874,15 @@ impl SessionActor {
         self: &Arc<Self>,
         new_registry_snapshot: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     ) -> (usize, bool, usize) {
+        // Defense in depth for every direct or future caller: armed sessions
+        // must never adopt a registry that can add hook commands, MCP clients,
+        // plugin tools, or disk-backed skills after the spawn-time filter.
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            tracing::warn!(
+                "Refusing plugin-registry snapshot while the GrokBuild hard-token budget is armed"
+            );
+            return (0, false, 0);
+        }
         let sid = self.session_info.id.0.as_ref();
         let session_cwd = std::path::Path::new(&self.session_info.cwd);
 

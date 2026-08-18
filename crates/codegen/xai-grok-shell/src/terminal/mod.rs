@@ -219,6 +219,11 @@ impl TerminalRunner {
 #[async_trait::async_trait]
 impl AsyncTerminalRunner for TerminalRunner {
     async fn run(&self, request: TerminalRunRequest) -> Result<TerminalRunResult, TerminalError> {
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Err(TerminalError::Other(
+                "terminal execution is disabled while the hard-token budget is armed".to_string(),
+            ));
+        }
         if request.stream {
             StreamingLocalTerminalRunner {
                 notifier: self.notifier.clone(),

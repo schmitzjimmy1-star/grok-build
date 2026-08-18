@@ -372,7 +372,33 @@ fn route_mcp_method(method: &str) -> Option<McpRoute> {
 
 #[tracing::instrument(skip_all, fields(method = %args.method))]
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
-    match route_mcp_method(args.method.as_ref()) {
+    let route = route_mcp_method(args.method.as_ref());
+    if xai_grok_tools::util::hard_budget_environment_present() {
+        match route {
+            Some(McpRoute::List) => {
+                let req = parse_params::<McpListRequest>(args)?;
+                if !req.cache {
+                    return Err(acp::Error::invalid_request()
+                        .data("MCP refresh is disabled while the hard-token budget is armed"));
+                }
+            }
+            Some(McpRoute::Delete) => {}
+            Some(McpRoute::Toggle) => {
+                let req = parse_params::<McpToggleRequest>(args)?;
+                if req.enabled {
+                    return Err(acp::Error::invalid_request()
+                        .data("MCP enablement is disabled while the hard-token budget is armed"));
+                }
+            }
+            Some(_) => {
+                return Err(acp::Error::invalid_request().data(
+                    "MCP execution and mutation are disabled while the hard-token budget is armed",
+                ));
+            }
+            None => return Err(acp::Error::method_not_found()),
+        }
+    }
+    match route {
         Some(McpRoute::List) => handle_list(agent, args).await,
         Some(McpRoute::Call) => handle_call(agent, args).await,
         Some(McpRoute::ReadResource) => handle_read_resource(agent, args).await,
