@@ -963,6 +963,12 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ReloadPlugins { registry } => {
+                            if xai_grok_tools::util::hard_budget_environment_present() {
+                                tracing::warn!(
+                                    "Ignoring plugin-registry reload while the GrokBuild hard-token budget is armed"
+                                );
+                                continue;
+                            }
                             // Eager fan-out: a plugin was added/removed/reloaded
                             // in another session. Adopt the pushed snapshot so this
                             // session's hooks, MCP, skills, and the client's

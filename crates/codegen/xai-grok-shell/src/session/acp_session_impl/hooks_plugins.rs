@@ -874,6 +874,15 @@ impl SessionActor {
         self: &Arc<Self>,
         new_registry_snapshot: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     ) -> (usize, bool, usize) {
+        // Defense in depth for every direct or future caller: armed sessions
+        // must never adopt a registry that can add hook commands, MCP clients,
+        // plugin tools, or disk-backed skills after the spawn-time filter.
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            tracing::warn!(
+                "Refusing plugin-registry snapshot while the GrokBuild hard-token budget is armed"
+            );
+            return (0, false, 0);
+        }
         let sid = self.session_info.id.0.as_ref();
         let session_cwd = std::path::Path::new(&self.session_info.cwd);
 

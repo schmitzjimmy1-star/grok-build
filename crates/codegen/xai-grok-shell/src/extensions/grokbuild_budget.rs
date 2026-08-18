@@ -12,7 +12,7 @@ use super::{ExtResult, to_raw_response};
 pub const METHOD: &str = "com.grokbuild/budget/status";
 pub const RECEIPTS_METHOD: &str = "com.grokbuild/budget/receipts";
 pub const CAPABILITY_KEY: &str = "com.grokbuild/hardTokenBudget";
-pub const CAPABILITY_VERSION: u32 = 2;
+pub const CAPABILITY_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +69,7 @@ fn capability() -> BudgetCapability {
         armed,
         configuration_valid,
         enforcement_point: "sampler-pre-dispatch",
-        ledger_version: 3,
+        ledger_version: 4,
         bound_method_version: 1,
         durable: true,
         process_shared: true,
@@ -179,7 +179,7 @@ mod tests {
     fn capability_is_honestly_namespaced_and_unarmed_by_default() {
         let value = capability_value();
         assert_eq!(CAPABILITY_KEY, "com.grokbuild/hardTokenBudget");
-        assert_eq!(value["capabilityVersion"], 2);
+        assert_eq!(value["capabilityVersion"], 3);
         assert_eq!(value["armed"], false);
         assert_eq!(value["enforcementPoint"], "sampler-pre-dispatch");
         assert_eq!(value["noAutomaticRetry"], false);

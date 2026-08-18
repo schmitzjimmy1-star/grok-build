@@ -2,10 +2,11 @@
 //!
 //! The budget is deliberately below the shell/session layer: every sampling
 //! client, including auxiliary and child-agent clients, must reserve before an
-//! HTTP dispatch. A reservation remains charged until complete provider usage
-//! settles it. Dropped streams, cancellation, crashes, and ambiguous transport
-//! failures therefore consume the full reservation instead of refunding money
-//! the runtime cannot prove was unspent.
+//! HTTP dispatch. Complete provider usage is retained as reconciliation
+//! evidence, but an untrusted endpoint cannot refund the conservative charge.
+//! Dropped streams, cancellation, crashes, and ambiguous transport failures
+//! likewise consume the full reservation instead of refunding money the
+//! runtime cannot prove was unspent.
 
 use std::fs::File;
 #[cfg(unix)]
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const LEDGER_VERSION: u32 = 3;
+const LEDGER_VERSION: u32 = 4;
 const MANIFEST_VERSION: u32 = 1;
 const ENV_LEDGER: &str = "GROK_HARD_TOKEN_BUDGET_LEDGER";
 const ENV_MANIFEST: &str = "GROK_HARD_TOKEN_BUDGET_MANIFEST";
@@ -275,7 +276,10 @@ impl HardTokenReservationReceipt {
                 HardTokenReceiptTerminalState::Reserved,
             ),
             ReservationLifecycle::SettledUsageReported => (
-                record.actual_tokens.unwrap_or(record.reserved_tokens),
+                record
+                    .actual_tokens
+                    .unwrap_or(record.reserved_tokens)
+                    .max(record.reserved_tokens),
                 HardTokenReceiptTerminalState::SettledUsageReported,
             ),
             ReservationLifecycle::TerminalAmbiguous => (
@@ -709,9 +713,14 @@ impl HardTokenBudget {
             if actual_tokens > record.reserved_tokens {
                 state.violated = true;
             }
+            // Provider usage is valuable reconciliation evidence, but it is
+            // not an authenticated lower bound. Never let a remote endpoint
+            // refund the conservative reservation by under-reporting usage.
+            // An over-report remains fail-closed and is charged as observed.
+            let charged_tokens = actual_tokens.max(record.reserved_tokens);
             state.settled_tokens = state
                 .settled_tokens
-                .checked_add(actual_tokens)
+                .checked_add(charged_tokens)
                 .ok_or(HardTokenBudgetError::Overflow)?;
             Ok(())
         })
@@ -853,8 +862,10 @@ impl HardTokenBudget {
 }
 
 impl BudgetReservation {
-    /// Release only the provably unused remainder. If this is never called the
-    /// durable ledger keeps the complete reservation charged.
+    /// Persist provider-reported usage without allowing an untrusted endpoint
+    /// to refund any part of the conservative reservation. If this is never
+    /// called the durable ledger keeps the complete reservation charged and
+    /// records an ambiguous terminal lifecycle on drop.
     pub fn settle(mut self, actual_tokens: u64) -> Result<(), HardTokenBudgetError> {
         self.budget.settle(&self.id, actual_tokens)?;
         self.active = false;
@@ -1009,7 +1020,12 @@ fn allocation_charged(
     {
         calls = calls.checked_add(1).ok_or(HardTokenBudgetError::Overflow)?;
         charged = charged
-            .checked_add(record.actual_tokens.unwrap_or(record.reserved_tokens))
+            .checked_add(
+                record
+                    .actual_tokens
+                    .unwrap_or(record.reserved_tokens)
+                    .max(record.reserved_tokens),
+            )
             .ok_or(HardTokenBudgetError::Overflow)?;
     }
     Ok((charged, calls))
@@ -1240,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_usage_releases_only_the_proven_remainder() {
+    fn provider_usage_cannot_refund_the_conservative_reservation() {
         let dir = private_dir("settle");
         let ledger = dir.join("ledger.json");
         let budget = HardTokenBudget::open_for_test(ledger, "settle".into(), 1_000).unwrap();
@@ -1250,9 +1266,9 @@ mod tests {
             .settle(125)
             .unwrap();
         let status = budget.status().unwrap();
-        assert_eq!(status.settled_tokens, 125);
+        assert_eq!(status.settled_tokens, 800);
         assert_eq!(status.outstanding_tokens, 0);
-        assert_eq!(status.remaining_tokens, 875);
+        assert_eq!(status.remaining_tokens, 200);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1431,9 +1447,9 @@ mod tests {
             .reserve_authorized_request("b-1", "model-b", &"a".repeat(64), "responses", 100, 100)
             .unwrap();
         let status = budget_b.status().unwrap();
-        assert_eq!(status.settled_tokens, 100);
+        assert_eq!(status.settled_tokens, 600);
         assert_eq!(status.outstanding_tokens, 300);
-        assert_eq!(status.remaining_tokens, 800);
+        assert_eq!(status.remaining_tokens, 300);
         assert_eq!(status.allocation_remaining_tokens, Some(300));
         assert_eq!(status.allocation_remaining_calls, Some(1));
         fs::remove_dir_all(dir).unwrap();
@@ -1448,7 +1464,7 @@ mod tests {
         let budget = HardTokenBudget::open_with_allocation_for_test(
             dir.join("ledger.json"),
             "same-turn-tool-loop".into(),
-            600,
+            900,
             "d".repeat(64),
             contract,
         )
@@ -1540,6 +1556,7 @@ mod tests {
             "same-provider-turn"
         );
         assert_eq!(snapshot.receipts[0].actual_tokens, Some(41));
+        assert_eq!(snapshot.receipts[0].charged_tokens, 300);
         assert_eq!(
             snapshot.receipts[0].terminal_state,
             HardTokenReceiptTerminalState::SettledUsageReported

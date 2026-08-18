@@ -2930,7 +2930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hard_budget_reconciles_only_complete_provider_usage() {
+    async fn hard_budget_records_usage_without_refunding_the_reservation() {
         let (base_url, calls, server) = chat_server().await;
         let dir = private_budget_dir("settle");
         let budget = HardTokenBudget::open_with_allocation_for_test(
@@ -2955,9 +2955,9 @@ mod tests {
         assert_eq!(response.usage.unwrap().total_tokens, 50);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let status = budget.status().unwrap();
-        assert_eq!(status.settled_tokens, 50);
+        assert_eq!(status.settled_tokens, 600);
         assert_eq!(status.outstanding_tokens, 0);
-        assert_eq!(status.remaining_tokens, 950);
+        assert_eq!(status.remaining_tokens, 400);
         server.abort();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3072,7 +3072,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let status = budget.status().unwrap();
         assert_eq!(status.allocation_remaining_calls, Some(0));
-        assert_eq!(status.settled_tokens, 100);
+        assert_eq!(status.settled_tokens, 1_200);
         assert_eq!(status.outstanding_tokens, 0);
         server.abort();
         std::fs::remove_dir_all(dir).unwrap();
