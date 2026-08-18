@@ -52,6 +52,7 @@ BUILD_ENVIRONMENT = {
     "rustupHome": "<account-home>/.rustup",
     "rustc": "<pinned-rustc>",
     "cargoTargetDir": "<candidate-target>",
+    "cargoIncremental": False,
     "locale": "C",
     "temporaryDirectory": "/private/tmp",
 }

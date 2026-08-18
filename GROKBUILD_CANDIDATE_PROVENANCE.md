@@ -17,7 +17,9 @@ from approved installation roots rooted at the current account record rather
 than ambient `PATH`, `HOME`, `CARGO_HOME`, or `RUSTUP_HOME`. The build executes
 under a minimal allowlisted environment with system tools ahead of the exact
 DotSlash directory; user Cargo config is refused instead of silently changing
-the build. DotSlash remains
+the build. Cargo incremental compilation is hard-disabled even though the
+upstream `release-dist` profile inherits `incremental = true`; the canonical
+environment receipt records that invariant. DotSlash remains
 part of the recorded toolchain because the pinned `bin/protoc` shim invokes it
 during code generation. Cargo reaches the
 repository's ignored `target` directory
@@ -53,7 +55,11 @@ The 4B.0 artifact is expected to report `unsigned` or `adHoc`; neither is a
 trusted signing identity. A later slice must require
 strict signing, Team Identifier `DD2GCQJVB4`, and the exact designated
 requirement before the app may select a candidate. An unsigned or ad-hoc
-staging artifact is evidence of reproducible bytes, not an armable runtime.
+staging artifact is not an armable runtime. Byte reproducibility is accepted
+only when two package/profile-clean builds from the same committed worktree,
+target root, and macOS host produce identical binary and manifest digests.
+This receipt does not claim cross-host reproducibility: schema v1 does not bind
+the Xcode SDK/linker, and the unstripped line-table debug data is path-sensitive.
 This candidate also advertises hard-budget capability v3 and ledger v4 after
 the conservative provider-usage settlement repair. The currently merged app
 accepts capability v2 only, so it intentionally rejects this candidate until

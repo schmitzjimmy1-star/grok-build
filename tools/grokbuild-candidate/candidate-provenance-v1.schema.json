@@ -50,6 +50,7 @@
             "rustupHome": "<account-home>/.rustup",
             "rustc": "<pinned-rustc>",
             "cargoTargetDir": "<candidate-target>",
+            "cargoIncremental": false,
             "locale": "C",
             "temporaryDirectory": "/private/tmp"
           }

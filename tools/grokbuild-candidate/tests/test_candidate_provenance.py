@@ -346,6 +346,7 @@ class CandidateProvenanceTests(unittest.TestCase):
         self.assertIn("user Cargo configuration is not allowed", wrapper)
         self.assertIn("cargo_environment=(", wrapper)
         self.assertIn("/usr/bin/env -i", wrapper)
+        self.assertIn('"CARGO_INCREMENTAL=0"', wrapper)
         self.assertIn('"$cargo_bin" clean --target-dir', wrapper)
         self.assertIn('"$cargo_bin" build --locked', wrapper)
         self.assertNotIn("repo_root=\"$(git ", wrapper)
@@ -355,6 +356,7 @@ class CandidateProvenanceTests(unittest.TestCase):
         self.assertNotIn("+1.94.0", candidate.BUILD_COMMAND)
         self.assertEqual(candidate.BUILD_COMMAND[0:2], ["cargo", "build"])
         self.assertTrue(candidate.BUILD_ENVIRONMENT["clearEnvironment"])
+        self.assertFalse(candidate.BUILD_ENVIRONMENT["cargoIncremental"])
         self.assertEqual(candidate.BUILD_ENVIRONMENT["path"][0], "/usr/bin")
 
     def test_shape_rejects_build_environment_drift(self):

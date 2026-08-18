@@ -78,6 +78,7 @@ cargo_environment=(
   "RUSTUP_HOME=$HOME/.rustup"
   "RUSTC=$rustc_bin"
   "CARGO_TARGET_DIR=$cargo_target_root"
+  "CARGO_INCREMENTAL=0"
 )
 "${cargo_environment[@]}" "$cargo_bin" clean --target-dir "$cargo_target_root" --profile release-dist -p xai-grok-pager-bin
 "${cargo_environment[@]}" "$cargo_bin" build --locked --profile release-dist -p xai-grok-pager-bin --features release-dist
