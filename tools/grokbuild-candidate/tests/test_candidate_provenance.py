@@ -316,7 +316,7 @@ class CandidateProvenanceTests(unittest.TestCase):
         self.assertNotEqual(resolved, fake)
         self.assertTrue(resolved.is_absolute())
 
-    def test_multicall_rustup_preserves_approved_invocation_name(self):
+    def test_multicall_rustup_binds_physical_target_and_invocation_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "rustup-init"
@@ -324,15 +324,19 @@ class CandidateProvenanceTests(unittest.TestCase):
             os.chmod(target, 0o700)
             invocation = root / "rustup"
             invocation.symlink_to(target)
-            self.assertEqual(
-                candidate.require_executable(
-                    invocation,
-                    "rustup",
-                    preserve_invocation_path=True,
-                ),
-                invocation.absolute(),
-            )
-            self.assertEqual(candidate.require_executable(invocation, "rustup"), target.resolve())
+            with mock.patch.object(candidate, "resolve_rustup", return_value=(invocation, target)):
+                with mock.patch.object(candidate, "require_executable", return_value=target):
+                    with mock.patch.object(candidate, "run") as mocked_run:
+                        mocked_run.return_value = subprocess.CompletedProcess(
+                            [],
+                            0,
+                            stdout=str(target),
+                            stderr="",
+                        )
+                        candidate.resolve_rust_tool("cargo")
+            args, kwargs = mocked_run.call_args
+            self.assertEqual(args[0][0], str(invocation))
+            self.assertEqual(kwargs["executable"], target)
 
     def test_build_wrapper_uses_absolute_attestation_tools_and_preclean(self):
         wrapper = MODULE_PATH.with_name("build_candidate.sh").read_text(encoding="utf-8")

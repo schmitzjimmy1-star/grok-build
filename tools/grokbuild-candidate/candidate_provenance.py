@@ -78,6 +78,7 @@ def run(
     cwd: Path | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    executable: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         list(args),
@@ -87,6 +88,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=os.environ.copy() if env is None else env,
+        executable=str(executable) if executable is not None else None,
     )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -119,7 +121,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def require_executable(path: Path, label: str, *, preserve_invocation_path: bool = False) -> Path:
+def require_executable(path: Path, label: str) -> Path:
     """Resolve one explicitly selected executable and reject writable aliases."""
     try:
         resolved = path.resolve(strict=True)
@@ -132,14 +134,10 @@ def require_executable(path: Path, label: str, *, preserve_invocation_path: bool
         raise CandidateError(f"{label} executable has an unexpected owner: {resolved}")
     if stat.S_IMODE(metadata.st_mode) & 0o022:
         raise CandidateError(f"{label} executable is group/other writable: {resolved}")
-    # Some multi-call tools select behavior from argv[0]. Homebrew's `rustup`
-    # may point at `rustup-init`; validate the physical target but preserve the
-    # approved invocation name so the child enters rustup mode, not installer
-    # mode. Other tools execute their resolved physical file directly.
-    return path.absolute() if preserve_invocation_path else resolved
+    return resolved
 
 
-def resolve_rustup() -> Path:
+def resolve_rustup() -> tuple[Path, Path]:
     account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     candidates = [
         account_home / ".cargo/bin/rustup",
@@ -148,16 +146,21 @@ def resolve_rustup() -> Path:
     ]
     for path in candidates:
         if path.exists() or path.is_symlink():
-            return require_executable(path, "rustup", preserve_invocation_path=True)
+            # Rustup is a multi-call executable: preserve the approved `rustup`
+            # invocation name in argv[0], but execute the validated physical
+            # target directly so a leaf symlink is not reopened after checking.
+            return path.absolute(), require_executable(path, "rustup")
     raise CandidateError("pinned rustup executable is unavailable in an approved location")
 
 
 def resolve_rust_tool(name: str) -> Path:
     if name not in {"cargo", "rustc"}:
         raise CandidateError(f"unsupported Rust tool: {name}")
+    invocation, physical = resolve_rustup()
     result = run(
-        [str(resolve_rustup()), "which", name, "--toolchain", RUST_TOOLCHAIN],
+        [str(invocation), "which", name, "--toolchain", RUST_TOOLCHAIN],
         env=tool_environment(),
+        executable=physical,
     )
     path = Path(result.stdout.strip())
     if not path.is_absolute():
