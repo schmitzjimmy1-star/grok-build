@@ -23,7 +23,7 @@ jobs:
           rustup override set 1.94.0
           cargo install dotslash --version 0.5.7 --locked
       - name: Candidate provenance tests
-        run: python3 -m unittest discover -s tools/grokbuild-candidate/tests -p 'test_*.py' -v
+        run: /usr/bin/python3 -m unittest discover -s tools/grokbuild-candidate/tests -p 'test_*.py' -v
       - name: Prepare private Cargo target
         run: |
           mkdir -m 700 "$RUNNER_TEMP/grokbuild-cargo-target"

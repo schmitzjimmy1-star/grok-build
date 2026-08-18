@@ -35,18 +35,23 @@ class CandidateProvenanceTests(unittest.TestCase):
                 "officialBaseSHA": "b" * 40,
                 "upstreamReplayBaseSHA": "c" * 40,
                 "forkSourceSHA": source_sha,
-                "sourceRev": "fixture-source-rev",
+                "sourceRev": "f" * 40,
                 "cargoLockSHA256": "d" * 64,
             },
             "toolchain": {
                 "rustVersion": "rustc 1.94.0 (fixture)",
                 "cargoVersion": "cargo 1.94.0 (fixture)",
                 "dotslashVersion": "DotSlash 0.5.7",
+                "rustcSHA256": "1" * 64,
+                "cargoSHA256": "2" * 64,
+                "dotslashSHA256": "3" * 64,
                 "targetTriple": "aarch64-apple-darwin",
                 "architecture": "arm64",
             },
             "build": {
+                "preBuildCommand": candidate.PREBUILD_COMMAND,
                 "command": candidate.BUILD_COMMAND,
+                "environment": json.loads(json.dumps(candidate.BUILD_ENVIRONMENT)),
                 "profile": "release-dist",
                 "package": "xai-grok-pager-bin",
                 "features": ["release-dist"],
@@ -123,9 +128,8 @@ class CandidateProvenanceTests(unittest.TestCase):
                 "designated => identifier fixture\n",
             )
 
-        with mock.patch.object(candidate.shutil, "which", return_value="/usr/bin/codesign"):
-            with mock.patch.object(candidate, "run", side_effect=fake_run):
-                signing = candidate.signing_identity(Path("/private/tmp/candidate"))
+        with mock.patch.object(candidate, "run", side_effect=fake_run):
+            signing = candidate.signing_identity(Path("/private/tmp/candidate"))
         self.assertEqual(signing["state"], "adHoc")
         self.assertIsNone(signing["teamIdentifier"])
         self.assertTrue(signing["strictVerification"])
@@ -211,7 +215,7 @@ class CandidateProvenanceTests(unittest.TestCase):
             self.git(repo, "config", "user.name", "GrokBuild Test")
             self.git(repo, "config", "user.email", "grokbuild-test@example.invalid")
             (repo / "Cargo.lock").write_text("# fixture lock\n", encoding="utf-8")
-            (repo / "SOURCE_REV").write_text("fixture-source-rev\n", encoding="utf-8")
+            (repo / "SOURCE_REV").write_text("f" * 40 + "\n", encoding="utf-8")
             self.git(repo, "add", "Cargo.lock", "SOURCE_REV")
             self.git(repo, "commit", "-qm", "official base")
             official = self.git(repo, "rev-parse", "HEAD")
@@ -244,6 +248,9 @@ class CandidateProvenanceTests(unittest.TestCase):
                 "rustVersion": "rustc 1.94.0 (fixture)",
                 "cargoVersion": "cargo 1.94.0 (fixture)",
                 "dotslashVersion": "DotSlash 0.5.7",
+                "rustcSHA256": "1" * 64,
+                "cargoSHA256": "2" * 64,
+                "dotslashSHA256": "3" * 64,
                 "targetTriple": "aarch64-apple-darwin",
                 "architecture": candidate.binary_architecture(binary),
             }
@@ -272,6 +279,67 @@ class CandidateProvenanceTests(unittest.TestCase):
             candidate.write_private(path, b"{}\n")
             with self.assertRaisesRegex(candidate.CandidateError, "refusing to replace"):
                 candidate.write_private(path, b"changed\n")
+
+    def test_source_rev_requires_small_regular_full_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "SOURCE_REV"
+            valid.write_text("a" * 40 + "\n", encoding="ascii")
+            self.assertEqual(candidate.read_source_rev(valid), "a" * 40)
+
+            oversized = root / "oversized"
+            oversized.write_bytes(b"b" * 129)
+            with self.assertRaisesRegex(candidate.CandidateError, "bounded|limit"):
+                candidate.read_source_rev(oversized)
+
+            link = root / "linked"
+            link.symlink_to(valid)
+            with self.assertRaisesRegex(candidate.CandidateError, "safely"):
+                candidate.read_source_rev(link)
+
+    def test_tool_resolution_ignores_ambient_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "cargo"
+            fake.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+            os.chmod(fake, 0o700)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": directory,
+                    "HOME": directory,
+                    "CARGO_HOME": directory,
+                    "RUSTUP_HOME": directory,
+                    "RUSTUP_TOOLCHAIN": "hostile",
+                },
+            ):
+                resolved = candidate.resolve_tool("cargo")
+        self.assertNotEqual(resolved, fake)
+        self.assertTrue(resolved.is_absolute())
+
+    def test_build_wrapper_uses_absolute_attestation_tools_and_preclean(self):
+        wrapper = MODULE_PATH.with_name("build_candidate.sh").read_text(encoding="utf-8")
+        self.assertIn('git_bin="/usr/bin/git"', wrapper)
+        self.assertIn('python_bin="/usr/bin/python3"', wrapper)
+        self.assertIn("unset CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN", wrapper)
+        self.assertIn("user Cargo configuration is not allowed", wrapper)
+        self.assertIn("cargo_environment=(", wrapper)
+        self.assertIn("/usr/bin/env -i", wrapper)
+        self.assertIn('"$cargo_bin" clean --target-dir', wrapper)
+        self.assertIn('"$cargo_bin" build --locked', wrapper)
+        self.assertNotIn("repo_root=\"$(git ", wrapper)
+        self.assertNotIn("\npython3 ", wrapper)
+
+    def test_manifest_build_command_matches_hardened_wrapper(self):
+        self.assertNotIn("+1.94.0", candidate.BUILD_COMMAND)
+        self.assertEqual(candidate.BUILD_COMMAND[0:2], ["cargo", "build"])
+        self.assertTrue(candidate.BUILD_ENVIRONMENT["clearEnvironment"])
+        self.assertEqual(candidate.BUILD_ENVIRONMENT["path"][0], "/usr/bin")
+
+    def test_shape_rejects_build_environment_drift(self):
+        document = self.fixture_document()
+        document["build"]["environment"]["path"].reverse()
+        with self.assertRaisesRegex(candidate.CandidateError, "environment"):
+            candidate.validate_shape(document)
 
     def test_schema_file_is_valid_json(self):
         schema_path = MODULE_PATH.with_name("candidate-provenance-v1.schema.json")

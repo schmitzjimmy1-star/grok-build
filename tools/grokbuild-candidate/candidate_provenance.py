@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Build and verify deterministic GrokBuild CLI candidate provenance."""
 
 from __future__ import annotations
@@ -8,8 +8,8 @@ import hashlib
 import json
 import os
 import platform
+import pwd
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -19,9 +19,12 @@ from typing import Any, Sequence
 
 
 SCHEMA_VERSION = 1
+RUST_TOOLCHAIN = "1.94.0"
+RUST_VERSION_PREFIX = "rustc 1.94.0 "
+CARGO_VERSION_PREFIX = "cargo 1.94.0 "
+DOTSLASH_VERSION = "DotSlash 0.5.7"
 BUILD_COMMAND = [
     "cargo",
-    "+1.94.0",
     "build",
     "--locked",
     "--profile",
@@ -31,6 +34,27 @@ BUILD_COMMAND = [
     "--features",
     "release-dist",
 ]
+PREBUILD_COMMAND = [
+    "cargo",
+    "clean",
+    "--target-dir",
+    "<candidate-target>",
+    "--profile",
+    "release-dist",
+    "-p",
+    "xai-grok-pager-bin",
+]
+BUILD_ENVIRONMENT = {
+    "clearEnvironment": True,
+    "home": "<account-home>",
+    "path": ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "<dotslash-directory>"],
+    "cargoHome": "<account-home>/.cargo",
+    "rustupHome": "<account-home>/.rustup",
+    "rustc": "<pinned-rustc>",
+    "cargoTargetDir": "<candidate-target>",
+    "locale": "C",
+    "temporaryDirectory": "/private/tmp",
+}
 EXPECTED_TOP_LEVEL_KEYS = {
     "schemaVersion",
     "source",
@@ -93,6 +117,114 @@ def sha256_file(path: Path) -> str:
     finally:
         os.close(fd)
     return digest.hexdigest()
+
+
+def require_executable(path: Path, label: str) -> Path:
+    """Resolve one explicitly selected executable and reject writable aliases."""
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as exc:
+        raise CandidateError(f"{label} executable is unavailable: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+        raise CandidateError(f"{label} is not an executable regular file: {resolved}")
+    if metadata.st_uid not in {0, os.getuid()}:
+        raise CandidateError(f"{label} executable has an unexpected owner: {resolved}")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise CandidateError(f"{label} executable is group/other writable: {resolved}")
+    return resolved
+
+
+def resolve_rustup() -> Path:
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates = [
+        account_home / ".cargo/bin/rustup",
+        Path("/opt/homebrew/opt/rustup/bin/rustup"),
+        Path("/usr/local/bin/rustup"),
+    ]
+    for path in candidates:
+        if path.exists() or path.is_symlink():
+            return require_executable(path, "rustup")
+    raise CandidateError("pinned rustup executable is unavailable in an approved location")
+
+
+def resolve_rust_tool(name: str) -> Path:
+    if name not in {"cargo", "rustc"}:
+        raise CandidateError(f"unsupported Rust tool: {name}")
+    result = run(
+        [str(resolve_rustup()), "which", name, "--toolchain", RUST_TOOLCHAIN],
+        env=tool_environment(),
+    )
+    path = Path(result.stdout.strip())
+    if not path.is_absolute():
+        raise CandidateError(f"rustup returned a non-absolute {name} path")
+    return require_executable(path, name)
+
+
+def resolve_dotslash() -> Path:
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates = [
+        account_home / ".cargo/bin/dotslash",
+        Path("/opt/homebrew/bin/dotslash"),
+        Path("/usr/local/bin/dotslash"),
+    ]
+    for path in candidates:
+        if path.exists() or path.is_symlink():
+            return require_executable(path, "dotslash")
+    raise CandidateError("DotSlash is unavailable in an approved location")
+
+
+def resolve_tool(name: str) -> Path:
+    if name in {"cargo", "rustc"}:
+        return resolve_rust_tool(name)
+    if name == "dotslash":
+        return resolve_dotslash()
+    raise CandidateError(f"unsupported candidate tool: {name}")
+
+
+def tool_environment(extra_path: Path | None = None) -> dict[str, str]:
+    account_home = pwd.getpwuid(os.getuid()).pw_dir
+    path_parts = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    if extra_path is not None:
+        path_parts.append(str(extra_path))
+    return {
+        "HOME": account_home,
+        "PATH": ":".join(path_parts),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TMPDIR": "/private/tmp",
+    }
+
+
+def read_source_rev(path: Path) -> str:
+    flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise CandidateError(f"cannot open SOURCE_REV safely: {exc}") from exc
+    try:
+        initial = os.fstat(fd)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size > 128:
+            raise CandidateError("SOURCE_REV must be a bounded regular file")
+        payload = os.read(fd, 129)
+        final = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if len(payload) > 128:
+        raise CandidateError("SOURCE_REV exceeds the 128-byte limit")
+    if (initial.st_dev, initial.st_ino, initial.st_size) != (
+        final.st_dev,
+        final.st_ino,
+        final.st_size,
+    ):
+        raise CandidateError("SOURCE_REV changed during inspection")
+    try:
+        value = payload.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise CandidateError("SOURCE_REV must be ASCII") from exc
+    if not GIT_SHA_RE.fullmatch(value):
+        raise CandidateError("SOURCE_REV must contain exactly one full Git SHA")
+    return value
 
 
 def canonical_bytes(document: dict[str, Any]) -> bytes:
@@ -186,7 +318,7 @@ def write_private(path: Path, payload: bytes) -> None:
 
 
 def git(repo: Path, *args: str) -> str:
-    return run(["git", *args], cwd=repo).stdout.strip()
+    return run(["/usr/bin/git", *args], cwd=repo, env=tool_environment()).stdout.strip()
 
 
 def require_clean_repo(repo: Path) -> None:
@@ -202,32 +334,50 @@ def require_commit(repo: Path, value: str, label: str) -> str:
 
 
 def require_ancestor(repo: Path, ancestor: str, descendant: str, label: str) -> None:
-    result = run(["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=repo, check=False)
+    result = run(
+        ["/usr/bin/git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo,
+        check=False,
+        env=tool_environment(),
+    )
     if result.returncode != 0:
         raise CandidateError(f"{label} {ancestor} is not an ancestor of {descendant}")
 
 
 def toolchain_identity(repo: Path) -> dict[str, str]:
-    rust = run(["rustc", "+1.94.0", "--version"], cwd=repo).stdout.strip()
-    cargo = run(["cargo", "+1.94.0", "--version"], cwd=repo).stdout.strip()
-    dotslash = run(["dotslash", "--version"], cwd=repo).stdout.strip()
-    verbose = run(["rustc", "+1.94.0", "-vV"], cwd=repo).stdout
+    rustc = resolve_rust_tool("rustc")
+    cargo_path = resolve_rust_tool("cargo")
+    dotslash_path = resolve_dotslash()
+    environment = tool_environment(dotslash_path.parent)
+    rust = run([str(rustc), "--version"], cwd=repo, env=environment).stdout.strip()
+    cargo = run([str(cargo_path), "--version"], cwd=repo, env=environment).stdout.strip()
+    dotslash = run([str(dotslash_path), "--version"], cwd=repo, env=environment).stdout.strip()
+    verbose = run([str(rustc), "-vV"], cwd=repo, env=environment).stdout
     host = next((line.split(":", 1)[1].strip() for line in verbose.splitlines() if line.startswith("host:")), "")
     if not host:
         raise CandidateError("rustc did not report a host target")
     machine = platform.machine().lower()
     architecture = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64"}.get(machine, machine)
+    if not rust.startswith(RUST_VERSION_PREFIX):
+        raise CandidateError(f"rustc is not the pinned {RUST_TOOLCHAIN} toolchain")
+    if not cargo.startswith(CARGO_VERSION_PREFIX):
+        raise CandidateError(f"Cargo is not the pinned {RUST_TOOLCHAIN} toolchain")
+    if dotslash != DOTSLASH_VERSION:
+        raise CandidateError(f"DotSlash must be exactly {DOTSLASH_VERSION}")
     return {
         "rustVersion": rust,
         "cargoVersion": cargo,
         "dotslashVersion": dotslash,
+        "rustcSHA256": sha256_file(rustc),
+        "cargoSHA256": sha256_file(cargo_path),
+        "dotslashSHA256": sha256_file(dotslash_path),
         "targetTriple": host,
         "architecture": architecture,
     }
 
 
 def binary_architecture(path: Path) -> str:
-    output = run(["/usr/bin/file", "-b", str(path)]).stdout.lower()
+    output = run(["/usr/bin/file", "-b", str(path)], env=tool_environment()).stdout.lower()
     if "arm64" in output or "aarch64" in output:
         return "arm64"
     if "x86_64" in output or "x86-64" in output:
@@ -261,8 +411,8 @@ def observed_cli_build(binary: Path) -> str:
 
 
 def signing_identity(binary: Path) -> dict[str, Any]:
-    codesign = shutil.which("codesign")
-    if codesign is None:
+    codesign_path = Path("/usr/bin/codesign")
+    if not codesign_path.exists():
         return {
             "state": "unsupported",
             "strictVerification": False,
@@ -270,7 +420,9 @@ def signing_identity(binary: Path) -> dict[str, Any]:
             "designatedRequirement": None,
         }
 
-    display = run([codesign, "-d", "--verbose=4", str(binary)], check=False)
+    codesign = str(require_executable(codesign_path, "codesign"))
+    environment = tool_environment()
+    display = run([codesign, "-d", "--verbose=4", str(binary)], check=False, env=environment)
     display_text = "\n".join((display.stdout, display.stderr))
     if display.returncode != 0 and "not signed at all" in display_text.lower():
         return {
@@ -280,8 +432,12 @@ def signing_identity(binary: Path) -> dict[str, Any]:
             "designatedRequirement": None,
         }
 
-    strict = run([codesign, "--verify", "--strict", "--verbose=2", str(binary)], check=False)
-    requirement = run([codesign, "-d", "-r-", str(binary)], check=False)
+    strict = run(
+        [codesign, "--verify", "--strict", "--verbose=2", str(binary)],
+        check=False,
+        env=environment,
+    )
+    requirement = run([codesign, "-d", "-r-", str(binary)], check=False, env=environment)
     requirement_text = "\n".join((requirement.stdout, requirement.stderr))
     designated = None
     for line in requirement_text.splitlines():
@@ -337,7 +493,7 @@ def build_document(
     require_ancestor(repo, replay_sha, source_sha, "upstream replay base")
 
     lockfile = repo / "Cargo.lock"
-    source_rev = (repo / "SOURCE_REV").read_text(encoding="utf-8").strip()
+    source_rev = read_source_rev(repo / "SOURCE_REV")
     cli_build = observed_cli_build(binary)
     expected_cli_build = f"1.0.5 ({source_sha[:7]})"
     if cli_build != expected_cli_build:
@@ -361,7 +517,9 @@ def build_document(
         },
         "toolchain": toolchain,
         "build": {
+            "preBuildCommand": PREBUILD_COMMAND,
             "command": BUILD_COMMAND,
+            "environment": BUILD_ENVIRONMENT,
             "profile": "release-dist",
             "package": "xai-grok-pager-bin",
             "features": ["release-dist"],
@@ -404,7 +562,7 @@ def validate_shape(document: dict[str, Any]) -> None:
             raise CandidateError(f"invalid {key}")
     if not isinstance(source["cargoLockSHA256"], str) or not SHA256_RE.fullmatch(source["cargoLockSHA256"]):
         raise CandidateError("invalid cargoLockSHA256")
-    if not isinstance(source["sourceRev"], str) or not source["sourceRev"]:
+    if not isinstance(source["sourceRev"], str) or not GIT_SHA_RE.fullmatch(source["sourceRev"]):
         raise CandidateError("invalid sourceRev")
 
     toolchain = document.get("toolchain")
@@ -412,18 +570,41 @@ def validate_shape(document: dict[str, Any]) -> None:
         "rustVersion",
         "cargoVersion",
         "dotslashVersion",
+        "rustcSHA256",
+        "cargoSHA256",
+        "dotslashSHA256",
         "targetTriple",
         "architecture",
     }:
         raise CandidateError("manifest toolchain fields do not match schema v1")
     if not all(isinstance(toolchain[key], str) and toolchain[key] for key in toolchain):
         raise CandidateError("manifest toolchain fields must be non-empty strings")
+    if not toolchain["rustVersion"].startswith(RUST_VERSION_PREFIX):
+        raise CandidateError("manifest rustc version is not pinned")
+    if not toolchain["cargoVersion"].startswith(CARGO_VERSION_PREFIX):
+        raise CandidateError("manifest Cargo version is not pinned")
+    if toolchain["dotslashVersion"] != DOTSLASH_VERSION:
+        raise CandidateError("manifest DotSlash version is not pinned")
+    for key in ("rustcSHA256", "cargoSHA256", "dotslashSHA256"):
+        if not SHA256_RE.fullmatch(toolchain[key]):
+            raise CandidateError(f"invalid {key}")
 
     build = document.get("build")
-    if not isinstance(build, dict) or set(build) != {"command", "profile", "package", "features"}:
+    if not isinstance(build, dict) or set(build) != {
+        "preBuildCommand",
+        "command",
+        "environment",
+        "profile",
+        "package",
+        "features",
+    }:
         raise CandidateError("manifest build fields do not match schema v1")
+    if build["preBuildCommand"] != PREBUILD_COMMAND:
+        raise CandidateError("manifest pre-build clean command is not frozen")
     if build["command"] != BUILD_COMMAND:
         raise CandidateError("manifest build command is not the frozen release-dist command")
+    if build["environment"] != BUILD_ENVIRONMENT:
+        raise CandidateError("manifest build environment is not frozen")
     if build["profile"] != "release-dist" or build["package"] != "xai-grok-pager-bin":
         raise CandidateError("manifest build target is not frozen")
     if build["features"] != ["release-dist"]:
@@ -571,6 +752,10 @@ def command_prepare_directory(args: argparse.Namespace) -> None:
     prepare_private_directory(args.directory, must_not_exist=args.must_not_exist)
 
 
+def command_resolve_tool(args: argparse.Namespace) -> None:
+    print(resolve_tool(args.name))
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     subparsers = root.add_subparsers(dest="command", required=True)
@@ -590,6 +775,9 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--directory", type=Path, required=True)
     prepare.add_argument("--must-not-exist", action="store_true")
     prepare.set_defaults(function=command_prepare_directory)
+    resolve = subparsers.add_parser("resolve-tool")
+    resolve.add_argument("--name", choices=("cargo", "rustc", "dotslash"), required=True)
+    resolve.set_defaults(function=command_resolve_tool)
     return root
 
 

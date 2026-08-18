@@ -15,18 +15,21 @@
         "officialBaseSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "upstreamReplayBaseSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "forkSourceSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "sourceRev": {"type": "string", "minLength": 1},
+        "sourceRev": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "cargoLockSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },
     "toolchain": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["rustVersion", "cargoVersion", "dotslashVersion", "targetTriple", "architecture"],
+      "required": ["rustVersion", "cargoVersion", "dotslashVersion", "rustcSHA256", "cargoSHA256", "dotslashSHA256", "targetTriple", "architecture"],
       "properties": {
-        "rustVersion": {"type": "string", "minLength": 1},
-        "cargoVersion": {"type": "string", "minLength": 1},
-        "dotslashVersion": {"type": "string", "minLength": 1},
+        "rustVersion": {"type": "string", "pattern": "^rustc 1\\.94\\.0 "},
+        "cargoVersion": {"type": "string", "pattern": "^cargo 1\\.94\\.0 "},
+        "dotslashVersion": {"const": "DotSlash 0.5.7"},
+        "rustcSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "cargoSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "dotslashSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "targetTriple": {"type": "string", "minLength": 1},
         "architecture": {"enum": ["arm64", "x86_64"]}
       }
@@ -34,9 +37,23 @@
     "build": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command", "profile", "package", "features"],
+      "required": ["preBuildCommand", "command", "environment", "profile", "package", "features"],
       "properties": {
-        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "preBuildCommand": {"const": ["cargo", "clean", "--target-dir", "<candidate-target>", "--profile", "release-dist", "-p", "xai-grok-pager-bin"]},
+        "command": {"const": ["cargo", "build", "--locked", "--profile", "release-dist", "-p", "xai-grok-pager-bin", "--features", "release-dist"]},
+        "environment": {
+          "const": {
+            "clearEnvironment": true,
+            "home": "<account-home>",
+            "path": ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "<dotslash-directory>"],
+            "cargoHome": "<account-home>/.cargo",
+            "rustupHome": "<account-home>/.rustup",
+            "rustc": "<pinned-rustc>",
+            "cargoTargetDir": "<candidate-target>",
+            "locale": "C",
+            "temporaryDirectory": "/private/tmp"
+          }
+        },
         "profile": {"const": "release-dist"},
         "package": {"const": "xai-grok-pager-bin"},
         "features": {"const": ["release-dist"]}
