@@ -119,7 +119,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def require_executable(path: Path, label: str) -> Path:
+def require_executable(path: Path, label: str, *, preserve_invocation_path: bool = False) -> Path:
     """Resolve one explicitly selected executable and reject writable aliases."""
     try:
         resolved = path.resolve(strict=True)
@@ -132,7 +132,11 @@ def require_executable(path: Path, label: str) -> Path:
         raise CandidateError(f"{label} executable has an unexpected owner: {resolved}")
     if stat.S_IMODE(metadata.st_mode) & 0o022:
         raise CandidateError(f"{label} executable is group/other writable: {resolved}")
-    return resolved
+    # Some multi-call tools select behavior from argv[0]. Homebrew's `rustup`
+    # may point at `rustup-init`; validate the physical target but preserve the
+    # approved invocation name so the child enters rustup mode, not installer
+    # mode. Other tools execute their resolved physical file directly.
+    return path.absolute() if preserve_invocation_path else resolved
 
 
 def resolve_rustup() -> Path:
@@ -144,7 +148,7 @@ def resolve_rustup() -> Path:
     ]
     for path in candidates:
         if path.exists() or path.is_symlink():
-            return require_executable(path, "rustup")
+            return require_executable(path, "rustup", preserve_invocation_path=True)
     raise CandidateError("pinned rustup executable is unavailable in an approved location")
 
 

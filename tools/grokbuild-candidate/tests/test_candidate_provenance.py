@@ -316,6 +316,24 @@ class CandidateProvenanceTests(unittest.TestCase):
         self.assertNotEqual(resolved, fake)
         self.assertTrue(resolved.is_absolute())
 
+    def test_multicall_rustup_preserves_approved_invocation_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "rustup-init"
+            target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(target, 0o700)
+            invocation = root / "rustup"
+            invocation.symlink_to(target)
+            self.assertEqual(
+                candidate.require_executable(
+                    invocation,
+                    "rustup",
+                    preserve_invocation_path=True,
+                ),
+                invocation.absolute(),
+            )
+            self.assertEqual(candidate.require_executable(invocation, "rustup"), target.resolve())
+
     def test_build_wrapper_uses_absolute_attestation_tools_and_preclean(self):
         wrapper = MODULE_PATH.with_name("build_candidate.sh").read_text(encoding="utf-8")
         self.assertIn('git_bin="/usr/bin/git"', wrapper)
