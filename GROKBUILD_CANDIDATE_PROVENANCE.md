@@ -9,7 +9,9 @@ sentinel. That policy is intentionally local Git configuration, not source.
 `xai-grok-pager-bin` package with the hardened `release-dist` profile **and**
 the separate `release-dist` feature. It refuses a dirty source tree and the
 common ambient variables that can silently replace the compiled build string
-or compiler flags. Cargo reaches the repository's ignored `target` directory
+or compiler flags. DotSlash 0.5.7 is part of the recorded toolchain because the
+pinned `bin/protoc` shim invokes it during code generation. Cargo reaches the
+repository's ignored `target` directory
 through an owner-private no-space cache symlink, because jemalloc's configure
 script refuses a prefix containing spaces. This avoids both the bad prefix and
 a second multi-gigabyte build cache. The artifact is staged outside the

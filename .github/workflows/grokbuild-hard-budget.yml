@@ -21,6 +21,7 @@ jobs:
         run: |
           rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
           rustup override set 1.94.0
+          cargo install dotslash --version 0.5.7 --locked
       - name: Candidate provenance tests
         run: python3 -m unittest discover -s tools/grokbuild-candidate/tests -p 'test_*.py' -v
       - name: Prepare private Cargo target

@@ -12,6 +12,11 @@ official_base="9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4"
 replay_base="d71f6e0c1f5acc5469e503e192fe14824e6f8c90"
 tool="$repo_root/tools/grokbuild-candidate/candidate_provenance.py"
 
+command -v dotslash >/dev/null || {
+  print -u2 "candidate build refused: dotslash is required by the pinned bin/protoc shim"
+  exit 2
+}
+
 [[ -z "$(git -C "$repo_root" status --porcelain=v1)" ]] || {
   print -u2 "candidate build refused: source worktree is dirty"
   exit 2

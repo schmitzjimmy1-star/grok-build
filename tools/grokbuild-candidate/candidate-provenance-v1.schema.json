@@ -22,10 +22,11 @@
     "toolchain": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["rustVersion", "cargoVersion", "targetTriple", "architecture"],
+      "required": ["rustVersion", "cargoVersion", "dotslashVersion", "targetTriple", "architecture"],
       "properties": {
         "rustVersion": {"type": "string", "minLength": 1},
         "cargoVersion": {"type": "string", "minLength": 1},
+        "dotslashVersion": {"type": "string", "minLength": 1},
         "targetTriple": {"type": "string", "minLength": 1},
         "architecture": {"enum": ["arm64", "x86_64"]}
       }

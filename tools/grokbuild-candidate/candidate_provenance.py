@@ -210,6 +210,7 @@ def require_ancestor(repo: Path, ancestor: str, descendant: str, label: str) -> 
 def toolchain_identity(repo: Path) -> dict[str, str]:
     rust = run(["rustc", "+1.94.0", "--version"], cwd=repo).stdout.strip()
     cargo = run(["cargo", "+1.94.0", "--version"], cwd=repo).stdout.strip()
+    dotslash = run(["dotslash", "--version"], cwd=repo).stdout.strip()
     verbose = run(["rustc", "+1.94.0", "-vV"], cwd=repo).stdout
     host = next((line.split(":", 1)[1].strip() for line in verbose.splitlines() if line.startswith("host:")), "")
     if not host:
@@ -219,6 +220,7 @@ def toolchain_identity(repo: Path) -> dict[str, str]:
     return {
         "rustVersion": rust,
         "cargoVersion": cargo,
+        "dotslashVersion": dotslash,
         "targetTriple": host,
         "architecture": architecture,
     }
@@ -409,6 +411,7 @@ def validate_shape(document: dict[str, Any]) -> None:
     if not isinstance(toolchain, dict) or set(toolchain) != {
         "rustVersion",
         "cargoVersion",
+        "dotslashVersion",
         "targetTriple",
         "architecture",
     }:

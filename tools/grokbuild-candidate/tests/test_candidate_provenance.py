@@ -41,6 +41,7 @@ class CandidateProvenanceTests(unittest.TestCase):
             "toolchain": {
                 "rustVersion": "rustc 1.94.0 (fixture)",
                 "cargoVersion": "cargo 1.94.0 (fixture)",
+                "dotslashVersion": "DotSlash 0.5.7",
                 "targetTriple": "aarch64-apple-darwin",
                 "architecture": "arm64",
             },
@@ -242,6 +243,7 @@ class CandidateProvenanceTests(unittest.TestCase):
             toolchain = {
                 "rustVersion": "rustc 1.94.0 (fixture)",
                 "cargoVersion": "cargo 1.94.0 (fixture)",
+                "dotslashVersion": "DotSlash 0.5.7",
                 "targetTriple": "aarch64-apple-darwin",
                 "architecture": candidate.binary_architecture(binary),
             }
