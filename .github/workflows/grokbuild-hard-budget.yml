@@ -13,7 +13,6 @@ jobs:
     runs-on: macos-15
     env:
       CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/grokbuild-cargo-target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -25,7 +24,9 @@ jobs:
       - name: Candidate provenance tests
         run: python3 -m unittest discover -s tools/grokbuild-candidate/tests -p 'test_*.py' -v
       - name: Prepare private Cargo target
-        run: mkdir -m 700 "$CARGO_TARGET_DIR"
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/grokbuild-cargo-target"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/grokbuild-cargo-target" >> "$GITHUB_ENV"
       - name: Format gate
         run: cargo fmt --all --check
       - name: Compile gate
@@ -41,6 +42,6 @@ jobs:
       - name: Armed pager tests
         run: cargo test --locked -p xai-grok-pager-bin hard_budget
       - name: Staged release candidate and provenance
-        env:
-          GROKBUILD_CARGO_TARGET_DIR: ${{ runner.temp }}/grokbuild-cargo-target
-        run: tools/grokbuild-candidate/build_candidate.sh "$RUNNER_TEMP/grokbuild-candidates"
+        run: |
+          export GROKBUILD_CARGO_TARGET_DIR="$CARGO_TARGET_DIR"
+          tools/grokbuild-candidate/build_candidate.sh "$RUNNER_TEMP/grokbuild-candidates"
