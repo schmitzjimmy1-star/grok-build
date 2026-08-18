@@ -21,6 +21,7 @@ use reqwest::header::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use xai_grok_sampling_types::error::{
     parse_error_code, try_parse_stream_error, user_facing_api_error_message,
@@ -32,9 +33,11 @@ use xai_grok_sampling_types::{
     is_check_event, messages, rs,
 };
 
+use crate::armed_credential::claim_armed_credential_owner;
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
 use crate::hard_budget::{BudgetReservation, HardTokenBudget, HardTokenBudgetError};
+use crate::hard_budget_provenance::canonical_auth_header_names;
 use xai_grok_auth::bearer_suffix;
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
@@ -591,6 +594,43 @@ fn hard_budget_backend_label(api_backend: &ApiBackend) -> &'static str {
     }
 }
 
+pub(crate) fn is_exact_loopback_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
+pub(crate) fn exact_loopback_endpoint_sha256(
+    base_url: &str,
+    api_backend: &str,
+) -> Option<String> {
+    if !is_exact_loopback_base_url(base_url) || base_url.contains('?') {
+        return None;
+    }
+    let path = match api_backend {
+        "chat_completions" => "chat/completions",
+        "responses" => "responses",
+        "messages" => "messages",
+        _ => return None,
+    };
+    Some(sha256_hex(
+        &EndpointTemplate::new(base_url, &IndexMap::new()).url_for_path(path),
+    ))
+}
+
 fn hard_budget_backend_path(api_backend: &ApiBackend) -> &'static str {
     match api_backend {
         ApiBackend::ChatCompletions => "chat/completions",
@@ -606,8 +646,23 @@ fn sha256_hex(value: &str) -> String {
         .collect()
 }
 
-fn serialize_provider_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(SamplingError::Serialization)
+pub(crate) fn serialize_provider_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(value).map_err(SamplingError::Serialization)?;
+    if let Some(active) = crate::hard_budget::active_v3_authority() {
+        let live = crate::hard_budget_runtime::live_serializer_payload_ceiling_bytes();
+        let ceiling = active
+            .provenance()
+            .route
+            .max_final_serialized_payload_bytes
+            .min(live);
+        let payload_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if payload_len > ceiling {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 serialized payload exceeds the live serializer ceiling",
+            ));
+        }
+    }
+    Ok(bytes)
 }
 
 fn responses_payload_has_hosted_tools(value: &serde_json::Value) -> bool {
@@ -790,6 +845,116 @@ fn hard_budget_messages_stream(
 // =============================================================================
 
 impl SamplingClient {
+    /// Construct the only armed v3 sampling client. A caller-created provenance
+    /// document is never enough: the process must already have registered an
+    /// `ActiveHardTokenV3Authority`, and the hard-token budget is taken from
+    /// that registered object. The one-shot credential is claimed only after
+    /// those checks. Callers cannot supply a substitute authority or ledger.
+    pub fn new_with_armed_v3(mut config: SamplerConfig) -> Result<Self> {
+        let Some(authority) = crate::hard_budget::active_v3_authority() else {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 requires the registered active hard-token authority",
+            ));
+        };
+        let provenance = authority.provenance();
+        provenance
+            .validate()
+            .map_err(|_| SamplingError::InvalidConfiguration("armed v3 provenance is invalid"))?;
+        if config.api_key.is_some()
+            || config.bearer_resolver.is_some()
+            || config.header_injector.is_some()
+            || config.attribution_callback.is_some()
+            || config.doom_loop_recovery.is_some()
+            || config.supports_backend_search
+            || !config.env_http_headers.is_empty()
+            || !config.extra_headers.is_empty()
+            || !config.query_params.is_empty()
+            || config.base_url.contains('?')
+            || config.max_retries.is_some_and(|retries| retries > 0)
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 forbids config, resolver, injector, query, retry, and environment auth",
+            ));
+        }
+        let expected_backend = match provenance.route.api_backend.as_str() {
+            "chat_completions" => ApiBackend::ChatCompletions,
+            "responses" => ApiBackend::Responses,
+            "messages" => ApiBackend::Messages,
+            _ => {
+                return Err(SamplingError::InvalidConfiguration(
+                    "armed v3 route backend is invalid",
+                ));
+            }
+        };
+        if !config.model.is_empty() && config.model != provenance.route.provider_facing_model {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 model does not match the registered route",
+            ));
+        }
+        if !is_exact_loopback_base_url(&config.base_url) {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 on this checkpoint permits only an exact loopback base URL",
+            ));
+        }
+        let actual_endpoint = EndpointTemplate::new(&config.base_url, &IndexMap::new())
+            .url_for_path(hard_budget_backend_path(&expected_backend));
+        if sha256_hex(&actual_endpoint) != provenance.route.endpoint_sha256 {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 base URL does not match the registered endpoint",
+            ));
+        }
+        let names = canonical_auth_header_names(&provenance.route.auth_scheme)
+            .map_err(|_| SamplingError::InvalidConfiguration("armed v3 auth scheme is invalid"))?;
+        config.model = provenance.route.provider_facing_model.clone();
+        config.api_backend = expected_backend;
+        config.auth_scheme = if names == ["x-api-key"] {
+            AuthScheme::XApiKey
+        } else {
+            AuthScheme::Bearer
+        };
+        config.max_retries = Some(0);
+        let mut client =
+            Self::new_with_hard_token_budget(config, Some(authority.budget().clone()))?;
+        let owner = claim_armed_credential_owner().map_err(|_| {
+            SamplingError::InvalidConfiguration(
+                "armed v3 credential owner is missing, inactive, or already claimed",
+            )
+        })?;
+        let credential = owner.into_bytes();
+        for name in names {
+            let value = if *name == "authorization" {
+                let mut bearer = Zeroizing::new(Vec::with_capacity(7 + credential.len()));
+                bearer.extend_from_slice(b"Bearer ");
+                bearer.extend_from_slice(&credential);
+                HeaderValue::from_bytes(&bearer).map_err(|_| {
+                    SamplingError::InvalidConfiguration(
+                        "armed credential is not valid header bytes",
+                    )
+                })?
+            } else {
+                HeaderValue::from_bytes(&credential).map_err(|_| {
+                    SamplingError::InvalidConfiguration(
+                        "armed credential is not valid header bytes",
+                    )
+                })?
+            };
+            client
+                .default_headers
+                .insert(HeaderName::from_static(name), value);
+        }
+        Ok(client)
+    }
+
+    /// Construct from the current process authority: the armed v3 constructor
+    /// when one is registered, otherwise the ordinary unarmed constructor.
+    pub fn from_process_config(config: SamplerConfig) -> Result<Self> {
+        if crate::hard_budget::active_v3_authority().is_some() {
+            Self::new_with_armed_v3(config)
+        } else {
+            Self::new(config)
+        }
+    }
+
     /// Construct a sampling client from a [`SamplerConfig`].
     ///
     /// Grabs the process-wide shared `reqwest::Client` (HTTP/2 by
@@ -797,6 +962,11 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        if crate::hard_budget::active_v3_authority().is_some() {
+            return Err(SamplingError::InvalidConfiguration(
+                "armed v3 requires the dedicated armed constructor",
+            ));
+        }
         let hard_token_budget = HardTokenBudget::from_env().map_err(|error| {
             tracing::error!(%error, "hard token budget initialization refused sampling client");
             SamplingError::InvalidConfiguration("hard token budget configuration is invalid")
@@ -4138,5 +4308,356 @@ mod tests {
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    #[test]
+    fn armed_v3_constructor_requires_registered_authority_budget_and_one_shot_owner() {
+        use crate::armed_credential::{ArmedCredentialOwner, install_armed_credential_owner};
+        use zeroize::Zeroizing;
+
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let unbound_dir = crate::hard_budget::v3_test_support::private_dir("armed-ctor-unbound");
+        let dir = crate::hard_budget::v3_test_support::private_dir("armed-ctor");
+        let _unbound = crate::hard_budget::v3_test_support::bind(&unbound_dir);
+        install_armed_credential_owner(
+            ArmedCredentialOwner::from_receiver(Zeroizing::new(b"fake-sentinel".to_vec())).unwrap(),
+        )
+        .unwrap();
+        assert!(SamplingClient::new_with_armed_v3(SamplerConfig::default()).is_err());
+
+        let loopback = "http://127.0.0.1:9/v1".to_string();
+        let _authority = crate::hard_budget::v3_test_support::activate_with_route(
+            &dir,
+            loopback_route(&loopback, "responses"),
+        );
+        let mut keyed = SamplerConfig::default();
+        keyed.base_url = loopback.clone();
+        keyed.api_key = Some("sk-test".into());
+        assert!(SamplingClient::new_with_armed_v3(keyed).is_err());
+
+        let mut extra = SamplerConfig::default();
+        extra.base_url = loopback.clone();
+        extra.extra_headers.insert("x-debug".into(), "1".into());
+        assert!(SamplingClient::new_with_armed_v3(extra).is_err());
+
+        let mut queried = SamplerConfig::default();
+        queried.base_url = loopback.clone();
+        queried
+            .query_params
+            .insert("api-version".into(), "1".into());
+        assert!(SamplingClient::new_with_armed_v3(queried).is_err());
+
+        let mut remote = SamplerConfig::default();
+        remote.base_url = "https://openrouter.ai/api/v1".into();
+        assert!(SamplingClient::new_with_armed_v3(remote).is_err());
+
+        let mut armed = SamplerConfig::default();
+        armed.base_url = loopback;
+        let client = SamplingClient::new_with_armed_v3(armed)
+            .expect("registered authority plus one-shot owner must construct");
+        assert!(client.hard_token_budget_enabled());
+        assert!(client.default_headers.contains_key(AUTHORIZATION));
+        assert!(SamplingClient::new(SamplerConfig::default()).is_err());
+        let mut again = SamplerConfig::default();
+        again.base_url = "http://127.0.0.1:9/v1".into();
+        assert!(SamplingClient::new_with_armed_v3(again).is_err());
+        std::fs::remove_dir_all(unbound_dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn armed_v3_derives_exact_auth_headers_from_scheme() {
+        use crate::armed_credential::{ArmedCredentialOwner, install_armed_credential_owner};
+        use reqwest::header::HeaderName;
+        use zeroize::Zeroizing;
+
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("bearer", "responses", &["authorization"]),
+            ("x_api_key", "messages", &["x-api-key"]),
+            (
+                "bearer_and_x_api_key",
+                "messages",
+                &["authorization", "x-api-key"],
+            ),
+        ];
+        for (scheme, backend, expected) in cases {
+            let _guard = crate::hard_budget::v3_test_support::lock();
+            let dir = crate::hard_budget::v3_test_support::private_dir(&format!(
+                "armed-headers-{scheme}"
+            ));
+            let loopback = "http://127.0.0.1:9/v1".to_string();
+            let mut route = loopback_route(&loopback, backend);
+            route.auth_scheme = (*scheme).into();
+            install_armed_credential_owner(
+                ArmedCredentialOwner::from_receiver(Zeroizing::new(b"fake-sentinel".to_vec()))
+                    .unwrap(),
+            )
+            .unwrap();
+            let _authority =
+                crate::hard_budget::v3_test_support::activate_with_route(&dir, route);
+            let client = SamplingClient::new_with_armed_v3(armed_loopback_config(loopback))
+                .expect("registered authority plus one-shot owner must construct");
+            let mut present = Vec::new();
+            if client.default_headers.contains_key(AUTHORIZATION) {
+                present.push("authorization");
+            }
+            if client
+                .default_headers
+                .contains_key(HeaderName::from_static("x-api-key"))
+            {
+                present.push("x-api-key");
+            }
+            assert_eq!(present, *expected, "scheme {scheme}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    fn loopback_route(
+        base_url: &str,
+        backend: &str,
+    ) -> crate::hard_budget_provenance::ResolvedRouteBoundV1 {
+        let mut route = crate::hard_budget::v3_test_support::route();
+        route.api_backend = backend.into();
+        route.provider_facing_model = "test-model".into();
+        let path = match backend {
+            "chat_completions" => "chat/completions",
+            "responses" => "responses",
+            "messages" => "messages",
+            other => panic!("unsupported armed loopback backend {other}"),
+        };
+        route.endpoint_sha256 =
+            sha256_hex(&EndpointTemplate::new(base_url, &IndexMap::new()).url_for_path(path));
+        route
+    }
+
+    async fn loopback_auth_server(
+        path: &'static str,
+        body: &'static [u8],
+    ) -> (
+        String,
+        std::sync::Arc<AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let auths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler_calls = std::sync::Arc::clone(&calls);
+        let handler_auths = std::sync::Arc::clone(&auths);
+        let app = Router::new().route(
+            path,
+            post(move |headers: axum::http::HeaderMap| {
+                let handler_calls = std::sync::Arc::clone(&handler_calls);
+                let handler_auths = std::sync::Arc::clone(&handler_auths);
+                let body = body.to_vec();
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    handler_auths.lock().unwrap().push(
+                        headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), calls, auths, server)
+    }
+
+    fn install_fake_loopback_owner() {
+        crate::armed_credential::install_armed_credential_owner(
+            crate::armed_credential::ArmedCredentialOwner::from_receiver(zeroize::Zeroizing::new(
+                b"loopback-sentinel".to_vec(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn armed_loopback_config(base_url: String) -> SamplerConfig {
+        SamplerConfig {
+            base_url,
+            max_completion_tokens: Some(100),
+            ..SamplerConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn armed_v3_fake_loopback_chat_responses_and_messages_send_one_shot_sentinel() {
+        let cases = [
+            (
+                "chat_completions",
+                "/v1/chat/completions",
+                br#"{"id":"chat","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":40,"completion_tokens":10,"total_tokens":50}}"#.as_slice(),
+            ),
+            (
+                "responses",
+                "/v1/responses",
+                br#"{"id":"resp","object":"response","created_at":0,"model":"test-model","status":"completed","output":[],"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}"#.as_slice(),
+            ),
+            (
+                "messages",
+                "/v1/messages",
+                br#"{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"test-model","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#.as_slice(),
+            ),
+        ];
+        for (backend, path, body) in cases {
+            let _guard = crate::hard_budget::v3_test_support::lock();
+            let (base_url, calls, auths, server) = loopback_auth_server(path, body).await;
+            let dir =
+                crate::hard_budget::v3_test_support::private_dir(&format!("loopback-{backend}"));
+            install_fake_loopback_owner();
+            let _authority = crate::hard_budget::v3_test_support::activate_with_route(
+                &dir,
+                loopback_route(&base_url, backend),
+            );
+            let client = SamplingClient::new_with_armed_v3(armed_loopback_config(base_url.clone()))
+                .expect("armed loopback client");
+            match backend {
+                "chat_completions" => {
+                    let _ = client.chat_completion(test_chat_request()).await;
+                }
+                "responses" => {
+                    let request = rs::CreateResponse {
+                        input: rs::InputParam::Text("tiny loopback".into()),
+                        model: Some("test-model".into()),
+                        max_output_tokens: Some(100),
+                        ..Default::default()
+                    };
+                    let mut wrapper = CreateResponseWrapper::new(request);
+                    wrapper.x_grok_req_id = Some(format!("loopback-{backend}"));
+                    let _ = client.create_response(wrapper).await;
+                }
+                "messages" => {
+                    let request = ConversationRequest {
+                        items: vec![xai_grok_sampling_types::ConversationItem::user(
+                            "tiny loopback",
+                        )],
+                        max_output_tokens: Some(100),
+                        x_grok_req_id: Some(format!("loopback-{backend}")),
+                        ..ConversationRequest::default()
+                    };
+                    let _ = client.conversation_messages(request).await;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{backend} must send once");
+            let auths = auths.lock().unwrap();
+            assert_eq!(
+                auths.len(),
+                1,
+                "{backend} must capture one authorization header"
+            );
+            assert_eq!(
+                auths[0], "Bearer loopback-sentinel",
+                "{backend} must send the one-shot fake credential"
+            );
+            assert!(
+                !auths[0].contains("sk-"),
+                "{backend} must not send a real key"
+            );
+            server.abort();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn armed_v3_route_mismatch_and_remote_host_make_zero_loopback_connections() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let (base_url, calls, _auths, server) = loopback_auth_server(
+            "/v1/chat/completions",
+            br#"{"id":"chat","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .await;
+        let dir = crate::hard_budget::v3_test_support::private_dir("loopback-mismatch");
+        let live = loopback_route(&base_url, "chat_completions");
+        let mut expected = live.clone();
+        expected.endpoint_sha256 = "0".repeat(64);
+        let manifest = crate::hard_budget::v3_test_support::write_manifest(&dir, expected);
+        assert!(matches!(
+            crate::hard_budget::V3AuthorityBuilder::open_with_manifest(
+                dir.join("ledger.json"),
+                manifest,
+                "allocation-v3",
+            )
+            .unwrap()
+            .bind_actual(crate::hard_budget::v3_test_support::binding(live.clone())),
+            Err(crate::hard_budget::HardTokenBudgetError::RuntimeBindingMismatch)
+        ));
+
+        install_fake_loopback_owner();
+        let _authority = crate::hard_budget::v3_test_support::activate_with_route(&dir, live);
+        assert!(
+            SamplingClient::new_with_armed_v3(armed_loopback_config("http://127.0.0.1:9/v1".into()))
+                .is_err()
+        );
+        assert!(
+            SamplingClient::new_with_armed_v3(armed_loopback_config(
+                "https://openrouter.ai/api/v1".into()
+            ))
+            .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn armed_v3_rejects_same_provenance_different_ledger_before_claim_or_connect() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let (base_url, calls, _auths, server) = loopback_auth_server(
+            "/v1/chat/completions",
+            br#"{"id":"chat","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .await;
+        let dir = crate::hard_budget::v3_test_support::private_dir("same-prov-diff-ledger");
+        let route = loopback_route(&base_url, "chat_completions");
+        let actual = crate::hard_budget::v3_test_support::binding(route.clone());
+        let manifest = crate::hard_budget::v3_test_support::write_manifest(&dir, route);
+        let registered = crate::hard_budget::V3AuthorityBuilder::open_with_manifest(
+            dir.join("registered-ledger.json"),
+            manifest.clone(),
+            "allocation-v3",
+        )
+        .unwrap()
+        .bind_actual(actual.clone())
+        .unwrap();
+        let hostile = crate::hard_budget::V3AuthorityBuilder::open_with_manifest(
+            dir.join("hostile-ledger.json"),
+            manifest,
+            "allocation-v3",
+        )
+        .unwrap()
+        .bind_actual(actual)
+        .unwrap();
+        assert_eq!(
+            registered.provenance().sha256().unwrap(),
+            hostile.provenance().sha256().unwrap()
+        );
+        crate::hard_budget::install_active_v3_authority(&registered).unwrap();
+        assert!(matches!(
+            crate::hard_budget::require_registered_v3_authority(&hostile),
+            Err(crate::hard_budget::HardTokenBudgetError::ActiveAuthorityMismatch)
+        ));
+        install_fake_loopback_owner();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let client =
+            SamplingClient::new_with_armed_v3(armed_loopback_config(base_url.clone()))
+                .expect("only the registered ledger may construct the armed client");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(SamplingClient::new_with_armed_v3(armed_loopback_config(base_url)).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = client;
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

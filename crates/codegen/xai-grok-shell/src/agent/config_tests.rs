@@ -1073,6 +1073,7 @@ fn test_model_entry(
         env_key: env_key.map(EnvKeys::single),
         auth_provider: None,
         api_base_url: api_base_url.map(|s| s.to_string()),
+        model_provider: None,
     }
 }
 /// The effective-model RE-support lookup must use the model ACTUALLY used:
@@ -6735,6 +6736,7 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     }
 }
 #[test]

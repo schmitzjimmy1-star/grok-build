@@ -118,15 +118,30 @@ impl SamplerActor {
                 let event_tx = self.event_tx.clone();
                 let retry_policy = self.state.retry_policy.clone();
                 let request_inner = *request;
-                self.tasks.spawn(request_task::run_request_task(
-                    request_id,
-                    request_inner,
-                    effective_config,
-                    retry_policy,
-                    event_tx,
-                    cancel_token,
-                    completion_tx,
-                ));
+                match state::acquire_request_client(&mut self.state, effective_config.clone()) {
+                    Ok(client) => {
+                        self.tasks.spawn(request_task::run_request_task(
+                            request_id,
+                            request_inner,
+                            effective_config,
+                            client,
+                            retry_policy,
+                            event_tx,
+                            cancel_token,
+                            completion_tx,
+                        ));
+                    }
+                    Err(err) => {
+                        self.state.remove(&request_id);
+                        let _ = event_tx.send(crate::events::SamplingEvent::Failed {
+                            request_id: request_id.clone(),
+                            error: crate::events::SamplingErrorInfo::from(&err),
+                        });
+                        if let Some(tx) = completion_tx {
+                            let _ = tx.send(Err(err));
+                        }
+                    }
+                }
             }
             SamplerCommand::Cancel { request_id } => {
                 self.state.cancel(&request_id);

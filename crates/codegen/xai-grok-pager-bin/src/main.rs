@@ -47,6 +47,9 @@ use xai_grok_shell::leader::{
     ControlPayload, LeaderClient, LeaderEnvUrls, connect_or_spawn, socket_path_for_ws_url,
 };
 use xai_grok_update::{UpdateConfig, auto_update, enforce_version_policy_or_exit};
+
+#[cfg(target_os = "macos")]
+mod armed_credential;
 /// Apply headless args to an existing config, only overriding values that are
 /// explicitly set. This allows environment defaults to be preserved when
 /// specific args are not provided.
@@ -79,11 +82,11 @@ fn resolve_agent_profile_path(path: &std::path::Path) -> std::path::PathBuf {
                 "error: --agent-profile path is not a file: {}",
                 abs.display()
             );
-            std::process::exit(1);
+            exit_process(1);
         }
         Err(e) => {
             eprintln!("error: --agent-profile path '{}': {}", path.display(), e);
-            std::process::exit(1);
+            exit_process(1);
         }
     }
 }
@@ -186,7 +189,7 @@ async fn run_setup_command(json: bool) {
         eprintln!(
             "If you don't have a deployment key, contact your organization's Grok administrator."
         );
-        std::process::exit(1);
+        exit_process(1);
     }
     if json {
         match managed_config::fetch_setup_report().await {
@@ -202,7 +205,7 @@ async fn run_setup_command(json: bool) {
             }
             Err(e) => {
                 eprintln!("Couldn't fetch managed configuration. {e}");
-                std::process::exit(1);
+                exit_process(1);
             }
         }
         return;
@@ -221,7 +224,7 @@ async fn run_setup_command(json: bool) {
         }
         SetupOutcome::Failed(e) => {
             eprintln!("Couldn't apply managed configuration. {e}");
-            std::process::exit(1);
+            exit_process(1);
         }
     }
 }
@@ -1022,6 +1025,12 @@ async fn replay_acp_state_after_reconnect(
         .cloned()
         .or_else(|| restored.last().cloned())
 }
+fn exit_process(code: i32) -> ! {
+    xai_grok_sampler::discard_unclaimed_armed_credential_owner();
+    xai_grok_sampler::discard_unclaimed_measured_candidate_identity();
+    std::process::exit(code);
+}
+
 /// Flush observability, then exit. Used by the agent/headless signal handler.
 ///
 /// Does NOT write terminal escape codes — agent mode never enables TUI modes.
@@ -1031,7 +1040,7 @@ fn shutdown_and_flush_telemetry(exit_code: i32) -> ! {
     xai_grok_telemetry::sentry::flush_on_shutdown();
     xai_grok_telemetry::otel_layer::shutdown_otel();
     xai_grok_telemetry::debug_log::flush();
-    std::process::exit(exit_code);
+    exit_process(exit_code);
 }
 async fn forward_stdio_line_to_leader(
     line: Vec<u8>,
@@ -1849,7 +1858,7 @@ fn dispatch_version_if_requested(args: &PagerArgs) -> bool {
         xai_grok_update::channel_label(),
     ) {
         eprintln!("Error: {error}");
-        std::process::exit(1);
+        exit_process(1);
     }
     true
 }
@@ -1859,7 +1868,7 @@ fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     };
     if let Err(error) = xai_grok_pager::doctor_cmd::run(doctor_args.clone()) {
         eprintln!("Error: {error:#}");
-        std::process::exit(1);
+        exit_process(1);
     }
     true
 }
@@ -1873,23 +1882,64 @@ fn hard_budget_invocation_allowed(args: &PagerArgs) -> bool {
 }
 
 fn main() {
+    // This is deliberately before telemetry, version state, argument parsing,
+    // tracing, runtime construction, config, and every dispatch branch.
     let hard_budget_armed = xai_grok_tools::util::hard_budget_environment_present();
+    #[cfg(target_os = "macos")]
+    let early_armed_credential = match armed_credential::consume_if_armed(hard_budget_armed) {
+        Ok(credential) => credential,
+        Err(_) => {
+            exit_process(2);
+        }
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(credential) = early_armed_credential {
+        let owner = match credential.into_owner() {
+            Ok(owner) => owner,
+            Err(_) => exit_process(2),
+        };
+        if xai_grok_sampler::install_armed_credential_owner(owner).is_err() {
+            exit_process(2);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    match xai_grok_sampler::consume_measured_candidate_if_armed(
+        hard_budget_armed,
+        env!("VERSION_WITH_COMMIT"),
+        env!("SOURCE_COMMIT_SHA"),
+    ) {
+        Ok(Some(identity)) => {
+            if xai_grok_sampler::install_measured_candidate_identity(identity).is_err() {
+                exit_process(2);
+            }
+        }
+        Ok(None) => {}
+        Err(_) => exit_process(2),
+    }
+    #[cfg(not(target_os = "macos"))]
+    if hard_budget_armed {
+        // An armed launch is Darwin-only until the native receiver is ported.
+        // Refuse before telemetry, version, argument parsing, or runtime work.
+        exit_process(2);
+    }
     xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
     xai_grok_telemetry::startup::mark_process_start();
     if !hard_budget_armed {
         if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
-            std::process::exit(code);
+            exit_process(code);
         }
         if let Some(code) = xai_grok_pager::voice::maybe_run_capture_subprocess() {
-            std::process::exit(code);
+            exit_process(code);
         }
     }
     let args = PagerArgs::parse_cli();
     if hard_budget_armed && !hard_budget_invocation_allowed(&args) {
         eprintln!("Error: the GrokBuild hard-token budget requires `grok agent stdio`");
-        std::process::exit(2);
+        exit_process(2);
     }
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
+        xai_grok_sampler::discard_unclaimed_armed_credential_owner();
+        xai_grok_sampler::discard_unclaimed_measured_candidate_identity();
         return;
     }
     xai_grok_pager_minimal::install();
@@ -1913,7 +1963,7 @@ fn main() {
             "Update Grok to a version the policy allows, or ask your administrator \
              to fix the managed requirements."
         );
-        std::process::exit(2);
+        exit_process(2);
     }
     let _sentry_guard = if hard_budget_armed {
         None
@@ -1978,8 +2028,10 @@ fn main() {
             None => eprintln!("Error: {e:#}"),
         }
         drop(_sentry_guard);
-        std::process::exit(1);
+        exit_process(1);
     }
+    xai_grok_sampler::discard_unclaimed_armed_credential_owner();
+    xai_grok_sampler::discard_unclaimed_measured_candidate_identity();
 }
 async fn async_main(args: PagerArgs) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2030,7 +2082,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                  it was created with '{saved}'. Omit --sandbox to resume with '{saved}', \
                  or start a new session to use '{requested}'."
             );
-            std::process::exit(1);
+            exit_process(1);
         }
     };
     xai_grok_shell::config::apply_sandbox(
@@ -2055,6 +2107,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 if json {
                     let payload = serde_json::json!({
                         "currentVersion": env!("VERSION_WITH_COMMIT"),
+                        "sourceCommitSha": env!("SOURCE_COMMIT_SHA"),
                         "channel": xai_grok_update::channel_name().unwrap_or("unknown"),
                     });
                     println!("{}", serde_json::to_string(&payload)?);

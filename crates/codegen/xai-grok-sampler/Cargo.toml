@@ -30,6 +30,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+zeroize = "1.8.2"
 
 [dev-dependencies]
 # Mock HTTP server for actor / request_task integration tests.

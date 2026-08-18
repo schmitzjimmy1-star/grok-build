@@ -17,15 +17,22 @@ use std::io::{Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::hard_budget_provenance::{
+    CampaignPolicyV3, CandidateIdentityV1, HardTokenBoundProvenanceV1, HardTokenProvenanceError,
+    ResolvedConfigIdentityV1, ResolvedRouteBoundV1,
+};
+
 const LEDGER_VERSION: u32 = 4;
+#[cfg(test)]
 const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_V3_SCHEMA_VERSION: u32 = 3;
 const ENV_LEDGER: &str = "GROK_HARD_TOKEN_BUDGET_LEDGER";
 const ENV_MANIFEST: &str = "GROK_HARD_TOKEN_BUDGET_MANIFEST";
 const ENV_ALLOCATION: &str = "GROK_HARD_TOKEN_BUDGET_ALLOCATION";
@@ -42,6 +49,18 @@ pub enum HardTokenBudgetError {
     InvalidCeiling,
     #[error("hard-token-budget manifest is invalid")]
     InvalidManifest,
+    #[error("hard-token-budget legacy manifest is refused for armed execution")]
+    LegacyManifestRefused,
+    #[error("hard-token-budget manifest must be schema v3")]
+    UnsupportedManifestVersion,
+    #[error("hard-token-budget v3 runtime binding does not match the immutable expectation")]
+    RuntimeBindingMismatch,
+    #[error("hard-token-budget v3 authority is already active in this process")]
+    ActiveAuthorityAlreadyInstalled,
+    #[error("hard-token-budget v3 authority has not been activated")]
+    ActiveAuthorityUnavailable,
+    #[error("hard-token-budget v3 constructor requires the registered active authority")]
+    ActiveAuthorityMismatch,
     #[error("hard-token-budget allocation is unavailable")]
     AllocationUnavailable,
     #[error("hard-token-budget allocation call ceiling is exhausted")]
@@ -56,7 +75,7 @@ pub enum HardTokenBudgetError {
     RouteContractRequired,
     #[error("hard-token-budget parent directory is not private and owner-controlled")]
     UnsafeParent,
-    #[error("hard-token-budget artifact is not a private owner-controlled regular file")]
+    #[error("hard-token-budget artifact must be one owner-held private regular file")]
     UnsafeArtifact,
     #[error("hard-token-budget ledger identity does not match this process")]
     IdentityMismatch,
@@ -80,6 +99,8 @@ pub enum HardTokenBudgetError {
     Io(#[from] std::io::Error),
     #[error("hard-token-budget ledger is malformed: {0}")]
     Malformed(#[from] serde_json::Error),
+    #[error("hard-token-budget provenance is invalid: {0}")]
+    Provenance(#[from] HardTokenProvenanceError),
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +141,7 @@ pub struct HardTokenAllocationContract {
     pub route: HardTokenRouteContract,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HardTokenCampaignManifest {
@@ -127,6 +149,72 @@ struct HardTokenCampaignManifest {
     campaign_id: String,
     ceiling_tokens: u64,
     allocations: Vec<HardTokenAllocationContract>,
+}
+
+/// The v3 manifest is an immutable, credential-free expectation. It carries
+/// neither a caller-provided provenance digest nor any credential material.
+/// The digest exposed to ACP is produced only after the CLI binds this document
+/// to its actual candidate and resolved non-secret config identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HardTokenCampaignManifestV3 {
+    schema_version: u32,
+    campaign_id: String,
+    campaign_policy: CampaignPolicyV3,
+    candidate_expectation: CandidateIdentityV1,
+    config_expectation: ResolvedConfigIdentityV1,
+    allocations: Vec<HardTokenAllocationExpectationV3>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HardTokenAllocationExpectationV3 {
+    id: String,
+    packet_id: String,
+    prompt_sha256: String,
+    token_ceiling: u64,
+    max_model_calls: u64,
+    route_expectation: ResolvedRouteBoundV1,
+}
+
+/// Explicitly non-secret input supplied by the CLI after it has resolved its
+/// actual route/configuration. This foundation deliberately does not read
+/// config files, environments, or credentials, and therefore makes no TOCTOU
+/// claim until a runtime resolver constructs this value at the final boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HardTokenV3RuntimeBinding {
+    pub candidate: CandidateIdentityV1,
+    pub config_identity: ResolvedConfigIdentityV1,
+    pub route: ResolvedRouteBoundV1,
+}
+
+/// A validated v3 manifest selected from the armed environment but not yet
+/// active. It cannot be used to claim the armed credential or construct a
+/// governed client; `bind_actual` must first prove the live CLI identity.
+#[derive(Debug)]
+pub struct V3AuthorityBuilder {
+    ledger_path: PathBuf,
+    manifest_sha256: String,
+    campaign_id: String,
+    policy: CampaignPolicyV3,
+    expected_candidate: CandidateIdentityV1,
+    expected_config_identity: ResolvedConfigIdentityV1,
+    allocation: HardTokenAllocationExpectationV3,
+}
+
+/// The sole authority object eligible to construct an armed sampling client.
+/// It contains the budget and the CLI-produced provenance as one immutable
+/// pair; callers cannot independently pair a budget with an opaque digest.
+#[derive(Clone, Debug)]
+pub struct ActiveHardTokenV3Authority {
+    budget: HardTokenBudget,
+    provenance: HardTokenBoundProvenanceV1,
+}
+
+static ACTIVE_V3_AUTHORITY: OnceLock<Mutex<Option<ActiveHardTokenV3Authority>>> = OnceLock::new();
+
+fn active_v3_slot() -> &'static Mutex<Option<ActiveHardTokenV3Authority>> {
+    ACTIVE_V3_AUTHORITY.get_or_init(|| Mutex::new(None))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,9 +396,10 @@ impl HardTokenReservationReceipt {
     }
 }
 
-impl HardTokenBudget {
-    /// Resolve the all-or-nothing process contract. Ordinary CLI use sees no
-    /// budget when all three variables are absent; a partial contract fails.
+impl V3AuthorityBuilder {
+    /// Resolve the all-or-nothing armed environment into a v3-only builder.
+    /// A legacy v1 manifest is intentionally refused here rather than being
+    /// silently upgraded or granted authority over an armed credential.
     pub fn from_env() -> Result<Option<Self>, HardTokenBudgetError> {
         let values = (
             std::env::var_os(ENV_LEDGER),
@@ -334,6 +423,160 @@ impl HardTokenBudget {
         manifest_path: PathBuf,
         allocation_id: &str,
     ) -> Result<Self, HardTokenBudgetError> {
+        let (manifest, manifest_sha256) = load_manifest_v3(&manifest_path)?;
+        let allocation = manifest
+            .allocations
+            .iter()
+            .find(|allocation| allocation.id == allocation_id)
+            .cloned()
+            .ok_or(HardTokenBudgetError::AllocationUnavailable)?;
+        Ok(Self {
+            ledger_path,
+            manifest_sha256,
+            campaign_id: manifest.campaign_id,
+            policy: manifest.campaign_policy,
+            expected_candidate: manifest.candidate_expectation,
+            expected_config_identity: manifest.config_expectation,
+            allocation,
+        })
+    }
+
+    /// Bind exactly one live, CLI-produced non-secret identity to the frozen
+    /// manifest expectation. The resulting object remains unregistered until
+    /// the client installation path calls `install_active_v3_authority`.
+    pub fn bind_actual(
+        self,
+        actual: HardTokenV3RuntimeBinding,
+    ) -> Result<ActiveHardTokenV3Authority, HardTokenBudgetError> {
+        if actual.candidate != self.expected_candidate
+            || actual.config_identity != self.expected_config_identity
+            || actual.route != self.allocation.route_expectation
+        {
+            return Err(HardTokenBudgetError::RuntimeBindingMismatch);
+        }
+        let provenance = HardTokenBoundProvenanceV1::from_resolved_route(
+            self.campaign_id.clone(),
+            self.allocation.id.clone(),
+            actual.candidate,
+            actual.config_identity,
+            actual.route,
+        )?;
+        let expected_digest = provenance.sha256()?;
+        let allocation = HardTokenAllocationContract {
+            id: self.allocation.id,
+            packet_id: self.allocation.packet_id,
+            prompt_sha256: self.allocation.prompt_sha256,
+            token_ceiling: self.allocation.token_ceiling,
+            max_model_calls: self.allocation.max_model_calls,
+            route: HardTokenRouteContract {
+                model: provenance.route.provider_facing_model.clone(),
+                endpoint_sha256: provenance.route.endpoint_sha256.clone(),
+                api_backend: provenance.route.api_backend.clone(),
+                request_bound_tokens: provenance.route.conservative_request_bound_tokens,
+                max_payload_bytes: provenance.route.max_final_serialized_payload_bytes,
+                max_output_tokens: provenance.route.max_output_tokens,
+                // This is derived here, never supplied by the manifest/caller.
+                bound_provenance_sha256: expected_digest,
+            },
+        };
+        validate_allocation(&allocation)?;
+        let budget = HardTokenBudget::open_inner(
+            self.ledger_path,
+            self.campaign_id,
+            self.policy.allocatable_token_ceiling,
+            self.manifest_sha256,
+            Some(allocation),
+        )?;
+        Ok(ActiveHardTokenV3Authority { budget, provenance })
+    }
+}
+
+impl ActiveHardTokenV3Authority {
+    pub fn budget(&self) -> &HardTokenBudget {
+        &self.budget
+    }
+
+    pub fn provenance(&self) -> &HardTokenBoundProvenanceV1 {
+        &self.provenance
+    }
+}
+
+/// Atomically expose the first active v3 authority to capability/status
+/// projections. A second activation always fails, including an identical
+/// document, so a later route cannot replace credential-bearing authority.
+pub fn install_active_v3_authority(
+    authority: &ActiveHardTokenV3Authority,
+) -> Result<(), HardTokenBudgetError> {
+    let mut slot = active_v3_slot()
+        .lock()
+        .expect("active hard-token v3 authority lock poisoned");
+    if slot.is_some() {
+        return Err(HardTokenBudgetError::ActiveAuthorityAlreadyInstalled);
+    }
+    *slot = Some(authority.clone());
+    Ok(())
+}
+
+/// Capability/status consumers may observe only an already activated v3
+/// authority. Re-reading the environment cannot create one.
+pub fn active_v3_authority() -> Option<ActiveHardTokenV3Authority> {
+    active_v3_slot()
+        .lock()
+        .expect("active hard-token v3 authority lock poisoned")
+        .clone()
+}
+
+/// The armed sampler constructor may consume a credential only for the
+/// authority already registered in this process. A leftover `bind_actual`
+/// object is not enough, even when its provenance digest matches.
+pub fn require_registered_v3_authority(
+    authority: &ActiveHardTokenV3Authority,
+) -> Result<(), HardTokenBudgetError> {
+    let Some(active) = active_v3_authority() else {
+        return Err(HardTokenBudgetError::ActiveAuthorityUnavailable);
+    };
+    let expected = active.provenance().sha256()?;
+    let actual = authority.provenance().sha256()?;
+    if expected != actual || !active.budget().same_immutable_contract(authority.budget()) {
+        return Err(HardTokenBudgetError::ActiveAuthorityMismatch);
+    }
+    Ok(())
+}
+
+/// Parse the v3 environment, bind the caller-supplied live runtime identity,
+/// and register the authority exactly once. The caller must observe candidate,
+/// config, and route independently; this never copies the manifest expectation.
+pub fn bind_and_install_v3_authority(
+    actual: HardTokenV3RuntimeBinding,
+) -> Result<ActiveHardTokenV3Authority, HardTokenBudgetError> {
+    let Some(builder) = V3AuthorityBuilder::from_env()? else {
+        return Err(HardTokenBudgetError::IncompleteEnvironment);
+    };
+    let authority = builder.bind_actual(actual)?;
+    install_active_v3_authority(&authority)?;
+    Ok(authority)
+}
+
+impl HardTokenBudget {
+    /// Legacy compatibility shim. An armed environment is no longer sufficient
+    /// to produce a bare budget: only `V3AuthorityBuilder::from_env` may load
+    /// v3 authority, and it still must bind the actual CLI runtime before a
+    /// governed client can exist. Historical v1 manifests always refuse.
+    pub fn from_env() -> Result<Option<Self>, HardTokenBudgetError> {
+        match V3AuthorityBuilder::from_env()? {
+            None => Ok(None),
+            Some(_) => Err(HardTokenBudgetError::ActiveAuthorityUnavailable),
+        }
+    }
+
+    /// Historical v1 decode support for unit migration tests only. It is not
+    /// compiled into production and cannot activate an armed process.
+    #[cfg(test)]
+    pub(crate) fn open_legacy_with_manifest_for_test(
+        ledger_path: PathBuf,
+        manifest_path: PathBuf,
+        allocation_id: &str,
+    ) -> Result<Self, HardTokenBudgetError> {
         let (manifest, manifest_sha256) = load_manifest(&manifest_path)?;
         let allocation = manifest
             .allocations
@@ -348,6 +591,16 @@ impl HardTokenBudget {
             manifest_sha256,
             Some(allocation),
         )
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn open_with_manifest(
+        ledger_path: PathBuf,
+        manifest_path: PathBuf,
+        allocation_id: &str,
+    ) -> Result<Self, HardTokenBudgetError> {
+        Self::open_legacy_with_manifest_for_test(ledger_path, manifest_path, allocation_id)
     }
 
     #[cfg(test)]
@@ -444,6 +697,15 @@ impl HardTokenBudget {
     /// the exact authorized packet rather than merely a route with spare budget.
     pub fn allocation_contract(&self) -> Option<&HardTokenAllocationContract> {
         self.inner.allocation.as_ref()
+    }
+
+    fn same_immutable_contract(&self, other: &Self) -> bool {
+        self.inner.ledger_path == other.inner.ledger_path
+            && self.inner.lock_path == other.inner.lock_path
+            && self.inner.campaign_id == other.inner.campaign_id
+            && self.inner.ceiling_tokens == other.inner.ceiling_tokens
+            && self.inner.manifest_sha256 == other.inner.manifest_sha256
+            && self.inner.allocation == other.inner.allocation
     }
 
     /// Admit one provider dispatch only when its exact live route matches the
@@ -929,6 +1191,7 @@ fn validate_allocation(
     Ok(())
 }
 
+#[cfg(test)]
 fn load_manifest(path: &Path) -> Result<(HardTokenCampaignManifest, String), HardTokenBudgetError> {
     if !path.is_absolute() {
         return Err(HardTokenBudgetError::RelativeLedgerPath);
@@ -964,6 +1227,98 @@ fn load_manifest(path: &Path) -> Result<(HardTokenCampaignManifest, String), Har
         return Err(HardTokenBudgetError::InvalidManifest);
     }
     Ok((manifest, manifest_sha256))
+}
+
+fn load_manifest_v3(
+    path: &Path,
+) -> Result<(HardTokenCampaignManifestV3, String), HardTokenBudgetError> {
+    if !path.is_absolute() {
+        return Err(HardTokenBudgetError::RelativeLedgerPath);
+    }
+    let parent = path.parent().ok_or(HardTokenBudgetError::UnsafeParent)?;
+    validate_private_directory(parent)?;
+    let mut file = open_private_file(path, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let manifest_sha256 = sha256_bytes(&bytes);
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value.get("version").is_some() {
+        return Err(HardTokenBudgetError::LegacyManifestRefused);
+    }
+    if value.get("schemaVersion") != Some(&serde_json::json!(MANIFEST_V3_SCHEMA_VERSION)) {
+        return Err(HardTokenBudgetError::UnsupportedManifestVersion);
+    }
+    let manifest: HardTokenCampaignManifestV3 = serde_json::from_value(value)?;
+    validate_manifest_v3(&manifest)?;
+    Ok((manifest, manifest_sha256))
+}
+
+fn validate_manifest_v3(
+    manifest: &HardTokenCampaignManifestV3,
+) -> Result<(), HardTokenBudgetError> {
+    if manifest.schema_version != MANIFEST_V3_SCHEMA_VERSION
+        || validate_identifier(&manifest.campaign_id).is_err()
+        || manifest.allocations.is_empty()
+    {
+        return Err(HardTokenBudgetError::UnsupportedManifestVersion);
+    }
+    manifest
+        .campaign_policy
+        .validate()
+        .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+    // Validate both expectation identities through the same provenance rules
+    // used at binding time, without inventing a caller digest.
+    let first = manifest
+        .allocations
+        .first()
+        .ok_or(HardTokenBudgetError::InvalidManifest)?;
+    HardTokenBoundProvenanceV1::from_resolved_route(
+        manifest.campaign_id.clone(),
+        first.id.clone(),
+        manifest.candidate_expectation.clone(),
+        manifest.config_expectation.clone(),
+        first.route_expectation.clone(),
+    )
+    .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+
+    let mut ids = std::collections::HashSet::new();
+    let mut packet_ids = std::collections::HashSet::new();
+    let mut allocated = 0_u64;
+    for allocation in &manifest.allocations {
+        validate_identifier(&allocation.id).map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+        validate_identifier(&allocation.packet_id)
+            .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+        validate_sha256(&allocation.prompt_sha256)
+            .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+        HardTokenBoundProvenanceV1::from_resolved_route(
+            manifest.campaign_id.clone(),
+            allocation.id.clone(),
+            manifest.candidate_expectation.clone(),
+            manifest.config_expectation.clone(),
+            allocation.route_expectation.clone(),
+        )
+        .map_err(|_| HardTokenBudgetError::InvalidManifest)?;
+        if allocation.token_ceiling == 0
+            || allocation.max_model_calls == 0
+            || allocation.token_ceiling != allocation.route_expectation.allocation_token_ceiling
+            || allocation.max_model_calls != allocation.route_expectation.max_model_calls
+            || allocation
+                .route_expectation
+                .conservative_request_bound_tokens
+                > allocation.token_ceiling
+            || !ids.insert(allocation.id.as_str())
+            || !packet_ids.insert(allocation.packet_id.as_str())
+        {
+            return Err(HardTokenBudgetError::InvalidManifest);
+        }
+        allocated = allocated
+            .checked_add(allocation.token_ceiling)
+            .ok_or(HardTokenBudgetError::Overflow)?;
+    }
+    if allocated > manifest.campaign_policy.allocatable_token_ceiling {
+        return Err(HardTokenBudgetError::InvalidManifest);
+    }
+    Ok(())
 }
 
 fn validate_identifier(value: &str) -> Result<(), ()> {
@@ -1062,6 +1417,7 @@ fn open_private_file(path: &Path, create: bool) -> Result<File, HardTokenBudgetE
     if !metadata.file_type().is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
     {
         return Err(HardTokenBudgetError::UnsafeArtifact);
     }
@@ -1072,6 +1428,160 @@ fn open_private_file(path: &Path, create: bool) -> Result<File, HardTokenBudgetE
 #[cfg(not(unix))]
 fn open_private_file(_path: &Path, _create: bool) -> Result<File, HardTokenBudgetError> {
     Err(HardTokenBudgetError::UnsupportedPlatform)
+}
+
+#[cfg(test)]
+pub(crate) mod v3_test_support {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, MutexGuard};
+
+    pub struct V3AuthorityTestGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for V3AuthorityTestGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
+
+    pub fn lock() -> V3AuthorityTestGuard {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset();
+        V3AuthorityTestGuard { _lock: lock }
+    }
+
+    pub fn reset() {
+        *active_v3_slot()
+            .lock()
+            .expect("active hard-token v3 authority lock poisoned") = None;
+        crate::armed_credential::reset_armed_credential_owner_for_test();
+    }
+
+    pub fn route() -> ResolvedRouteBoundV1 {
+        ResolvedRouteBoundV1 {
+            route_id: "route-a".into(),
+            provider_id: "openrouter".into(),
+            provider_facing_model: "openai/gpt-4.1-mini".into(),
+            endpoint_sha256: "c".repeat(64),
+            api_backend: "responses".into(),
+            credential_transport: "fd_v1".into(),
+            auth_scheme: "bearer".into(),
+            max_final_serialized_payload_bytes: 500,
+            max_output_tokens: 100,
+            conservative_request_bound_tokens: 600,
+            allocation_token_ceiling: 1_000,
+            max_model_calls: 2,
+            text_only: true,
+            remote_context_forbidden: true,
+            multimodal_forbidden: true,
+            redirect_disabled: true,
+            retry_disabled: true,
+            tool_isolation: crate::hard_budget_provenance::ToolIsolationContractV1 {
+                auth_provider_helpers_disabled: true,
+                terminal_disabled: true,
+                external_mcp_disabled: true,
+                hooks_disabled: true,
+                plugins_disabled: true,
+                lsp_disabled: true,
+                workflows_disabled: true,
+                scheduler_disabled: true,
+                protected_authority_fs: true,
+                workspace_fs_confined: true,
+                sampler_transport_retries_disabled: true,
+                allowed_tool_ids: vec!["GrokBuild:read_file".into(), "GrokBuild:task".into()],
+            },
+        }
+    }
+
+    pub fn binding(route: ResolvedRouteBoundV1) -> HardTokenV3RuntimeBinding {
+        HardTokenV3RuntimeBinding {
+            candidate: CandidateIdentityV1 {
+                cli_build: "1.0.5 (003f955)".into(),
+                binary_sha256: "a".repeat(64),
+                source_commit_sha: "b".repeat(40),
+            },
+            config_identity: ResolvedConfigIdentityV1 {
+                source_kind: "resolved-managed-provider".into(),
+                generation: 7,
+                managed_provider_id: "openrouter".into(),
+                config_projection_sha256: "d".repeat(64),
+            },
+            route,
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn private_dir(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("grok-hard-budget-v3-{label}-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    pub fn write_manifest(dir: &Path, route: ResolvedRouteBoundV1) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binding = binding(route.clone());
+        let path = dir.join("manifest-v3.json");
+        let manifest = HardTokenCampaignManifestV3 {
+            schema_version: MANIFEST_V3_SCHEMA_VERSION,
+            campaign_id: "campaign-v3".into(),
+            campaign_policy: CampaignPolicyV3::exact(),
+            candidate_expectation: binding.candidate,
+            config_expectation: binding.config_identity,
+            allocations: vec![HardTokenAllocationExpectationV3 {
+                id: "allocation-v3".into(),
+                packet_id: "packet-v3".into(),
+                prompt_sha256: "e".repeat(64),
+                token_ceiling: route.allocation_token_ceiling,
+                max_model_calls: route.max_model_calls,
+                route_expectation: route,
+            }],
+        };
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    pub fn bind(dir: &Path) -> ActiveHardTokenV3Authority {
+        let route = route();
+        let actual = binding(route.clone());
+        let manifest = write_manifest(dir, route);
+        V3AuthorityBuilder::open_with_manifest(dir.join("ledger.json"), manifest, "allocation-v3")
+            .unwrap()
+            .bind_actual(actual)
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    pub fn activate(dir: &Path) -> ActiveHardTokenV3Authority {
+        activate_with_route(dir, route())
+    }
+
+    #[cfg(unix)]
+    pub fn activate_with_route(
+        dir: &Path,
+        route: ResolvedRouteBoundV1,
+    ) -> ActiveHardTokenV3Authority {
+        let actual = binding(route.clone());
+        let manifest = write_manifest(dir, route);
+        let authority = V3AuthorityBuilder::open_with_manifest(
+            dir.join("ledger.json"),
+            manifest,
+            "allocation-v3",
+        )
+        .unwrap()
+        .bind_actual(actual)
+        .unwrap();
+        install_active_v3_authority(&authority).unwrap();
+        authority
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1796,5 +2306,290 @@ mod tests {
             validate_route_contract(&contract),
             Err(HardTokenBudgetError::InvalidRouteContract)
         ));
+    }
+
+    #[test]
+    fn v3_bind_register_is_once_and_legacy_env_cannot_arm() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let dir = crate::hard_budget::v3_test_support::private_dir("bind-register");
+        assert!(active_v3_authority().is_none());
+
+        let unbound = crate::hard_budget::v3_test_support::bind(&dir);
+        assert!(active_v3_authority().is_none());
+        assert!(matches!(
+            require_registered_v3_authority(&unbound),
+            Err(HardTokenBudgetError::ActiveAuthorityUnavailable)
+        ));
+
+        let authority = crate::hard_budget::v3_test_support::activate(&dir);
+        require_registered_v3_authority(&authority).unwrap();
+        let hostile_manifest = crate::hard_budget::v3_test_support::write_manifest(
+            &dir,
+            crate::hard_budget::v3_test_support::route(),
+        );
+        let hostile = V3AuthorityBuilder::open_with_manifest(
+            dir.join("hostile-ledger.json"),
+            hostile_manifest,
+            "allocation-v3",
+        )
+        .unwrap()
+        .bind_actual(crate::hard_budget::v3_test_support::binding(
+            crate::hard_budget::v3_test_support::route(),
+        ))
+        .unwrap();
+        assert_eq!(
+            authority.provenance().sha256().unwrap(),
+            hostile.provenance().sha256().unwrap()
+        );
+        assert!(matches!(
+            require_registered_v3_authority(&hostile),
+            Err(HardTokenBudgetError::ActiveAuthorityMismatch)
+        ));
+        assert!(matches!(
+            install_active_v3_authority(&authority),
+            Err(HardTokenBudgetError::ActiveAuthorityAlreadyInstalled)
+        ));
+
+        let mut drifted = crate::hard_budget::v3_test_support::binding(
+            crate::hard_budget::v3_test_support::route(),
+        );
+        drifted.candidate.binary_sha256 = "f".repeat(64);
+        let manifest = crate::hard_budget::v3_test_support::write_manifest(
+            &dir,
+            crate::hard_budget::v3_test_support::route(),
+        );
+        assert!(matches!(
+            V3AuthorityBuilder::open_with_manifest(
+                dir.join("ledger-drift.json"),
+                manifest,
+                "allocation-v3",
+            )
+            .unwrap()
+            .bind_actual(drifted),
+            Err(HardTokenBudgetError::RuntimeBindingMismatch)
+        ));
+
+        let v1 = dir.join("legacy-v1.json");
+        fs::write(
+            &v1,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "campaignId": "old",
+                "ceilingTokens": 3_000_000,
+                "allocations": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&v1, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            V3AuthorityBuilder::open_with_manifest(
+                dir.join("legacy-ledger.json"),
+                v1,
+                "allocation-a",
+            ),
+            Err(HardTokenBudgetError::LegacyManifestRefused)
+        ));
+        assert!(matches!(HardTokenBudget::from_env(), Ok(None)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn from_env_refuses_complete_v3_environment_until_active() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let dir = crate::hard_budget::v3_test_support::private_dir("from-env-v3");
+        let manifest = crate::hard_budget::v3_test_support::write_manifest(
+            &dir,
+            crate::hard_budget::v3_test_support::route(),
+        );
+        let ledger = dir.join("ledger.json");
+        struct EnvRestore {
+            ledger: Option<std::ffi::OsString>,
+            manifest: Option<std::ffi::OsString>,
+            allocation: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.ledger {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+                    }
+                    match &self.manifest {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+                    }
+                    match &self.allocation {
+                        Some(value) => {
+                            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", value)
+                        }
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+                    }
+                }
+            }
+        }
+        let _env = EnvRestore {
+            ledger: std::env::var_os("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+            manifest: std::env::var_os("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+            allocation: std::env::var_os("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+        };
+        unsafe {
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", &ledger);
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", &manifest);
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", "allocation-v3");
+        }
+        assert!(matches!(
+            HardTokenBudget::from_env(),
+            Err(HardTokenBudgetError::ActiveAuthorityUnavailable)
+        ));
+        crate::hard_budget::v3_test_support::activate(&dir);
+        assert!(matches!(
+            HardTokenBudget::from_env(),
+            Err(HardTokenBudgetError::ActiveAuthorityUnavailable)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bind_and_install_v3_authority_requires_live_runtime_and_is_one_shot() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let dir = crate::hard_budget::v3_test_support::private_dir("bind-install");
+        let route = crate::hard_budget::v3_test_support::route();
+        let actual = crate::hard_budget::v3_test_support::binding(route.clone());
+        let manifest = crate::hard_budget::v3_test_support::write_manifest(&dir, route);
+        let ledger = dir.join("ledger.json");
+        struct EnvRestore {
+            ledger: Option<std::ffi::OsString>,
+            manifest: Option<std::ffi::OsString>,
+            allocation: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.ledger {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+                    }
+                    match &self.manifest {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+                    }
+                    match &self.allocation {
+                        Some(value) => {
+                            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", value)
+                        }
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+                    }
+                }
+            }
+        }
+        let _env = EnvRestore {
+            ledger: std::env::var_os("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+            manifest: std::env::var_os("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+            allocation: std::env::var_os("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+        };
+        unsafe {
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", &ledger);
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", &manifest);
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", "allocation-v3");
+        }
+        let mut drifted = actual.clone();
+        drifted.route.endpoint_sha256 = "0".repeat(64);
+        assert!(matches!(
+            bind_and_install_v3_authority(drifted),
+            Err(HardTokenBudgetError::RuntimeBindingMismatch)
+        ));
+        bind_and_install_v3_authority(actual.clone()).unwrap();
+        assert!(matches!(
+            bind_and_install_v3_authority(actual),
+            Err(HardTokenBudgetError::ActiveAuthorityAlreadyInstalled)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_private_file_refuses_hard_linked_manifest_ledger_and_lock() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        struct EnvRestore {
+            ledger: Option<std::ffi::OsString>,
+            manifest: Option<std::ffi::OsString>,
+            allocation: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.ledger {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+                    }
+                    match &self.manifest {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+                    }
+                    match &self.allocation {
+                        Some(value) => {
+                            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", value)
+                        }
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+                    }
+                }
+            }
+        }
+        let _env = EnvRestore {
+            ledger: std::env::var_os("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+            manifest: std::env::var_os("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+            allocation: std::env::var_os("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+        };
+
+        for artifact in ["manifest", "ledger", "lock"] {
+            let dir = crate::hard_budget::v3_test_support::private_dir(&format!(
+                "hard-link-{artifact}"
+            ));
+            let route = crate::hard_budget::v3_test_support::route();
+            let actual = crate::hard_budget::v3_test_support::binding(route.clone());
+            let manifest = crate::hard_budget::v3_test_support::write_manifest(&dir, route);
+            let ledger = dir.join("ledger.json");
+            fs::write(&ledger, b"{}").unwrap();
+            fs::set_permissions(&ledger, fs::Permissions::from_mode(0o600)).unwrap();
+            let lock = dir.join(".ledger.json.lock");
+            fs::write(&lock, b"").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+            let target = match artifact {
+                "manifest" => manifest.clone(),
+                "ledger" => ledger.clone(),
+                "lock" => lock.clone(),
+                _ => unreachable!(),
+            };
+            let alias = dir.join(format!("{artifact}-alias"));
+            fs::hard_link(&target, &alias).unwrap();
+            assert_eq!(fs::metadata(&target).unwrap().nlink(), 2);
+            let original = fs::read(&target).unwrap();
+            unsafe {
+                std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", &ledger);
+                std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", &manifest);
+                std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", "allocation-v3");
+            }
+            let error = if artifact == "manifest" {
+                V3AuthorityBuilder::from_env().unwrap_err()
+            } else {
+                V3AuthorityBuilder::from_env()
+                    .unwrap()
+                    .unwrap()
+                    .bind_actual(actual)
+                    .unwrap_err()
+            };
+            assert!(
+                matches!(error, HardTokenBudgetError::UnsafeArtifact),
+                "{artifact} refused as {error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "hard-token-budget artifact must be one owner-held private regular file"
+            );
+            assert!(active_v3_authority().is_none());
+            assert_eq!(fs::read(&target).unwrap(), original);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

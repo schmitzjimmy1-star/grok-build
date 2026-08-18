@@ -11,6 +11,7 @@ pub(crate) mod handlers;
 pub mod init;
 pub mod model_providers;
 pub mod models;
+pub(crate) mod hard_budget_runtime;
 pub mod mvp_agent;
 pub(crate) mod otel_gate;
 pub(crate) mod proxy;

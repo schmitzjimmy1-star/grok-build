@@ -2254,7 +2254,7 @@ const WORKTREE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 
 /// What the actor is handed once and holds for the life of the session.
 pub(crate) struct SessionDeps {
-    pub(crate) sampling_client: OaiCompatClient,
+    pub(crate) sampling_client: Option<OaiCompatClient>,
     pub(crate) storage_mode: StorageMode,
     pub(crate) auth_manager: Option<Arc<crate::auth::AuthManager>>,
     pub(crate) relay_sync: Option<crate::relay::RelaySync>,
@@ -2376,7 +2376,7 @@ pub(crate) async fn new_with_explicit_dir(
             relay_sync: None,
             summary: crate::session::summary::SummaryGenerator::new(
                 crate::session::summary::SummaryConfig {
-                    sampling_client,
+                    sampling_client: Some(sampling_client),
                     model: session_summary_model,
                     persistence_tx: summary_tx,
                 },

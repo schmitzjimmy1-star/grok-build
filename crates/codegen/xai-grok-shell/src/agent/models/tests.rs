@@ -554,6 +554,7 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     flagged.info.show_model_fingerprint = true;
     mgr.insert_test_entry("fp-model", flagged);
@@ -566,6 +567,7 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            model_provider: None,
         },
     );
 
@@ -575,6 +577,7 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     custom.info.show_model_fingerprint = true;
     mgr.insert_test_entry("enterprise-key", custom);
@@ -599,6 +602,7 @@ fn reasoning_effort_helpers_resolve_wire_name_to_catalog_key() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     custom.info.supports_reasoning_effort = true;
     custom.info.reasoning_effort = Some(ReasoningEffort::High);
@@ -790,6 +794,7 @@ fn rebuild_updates_models_and_available() {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            model_provider: None,
         },
     );
 
@@ -844,6 +849,7 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     reasoning_entry.info.supports_reasoning_effort = true;
     prefetched.insert("reasoning-model".to_string(), reasoning_entry);
@@ -866,6 +872,7 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     prefetched.insert("plain-model".to_string(), plain_entry);
 
@@ -893,6 +900,7 @@ fn reasoning_effort_override_skips_models_that_do_not_offer_level() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     no_none.info.supports_reasoning_effort = true;
     no_none.info.reasoning_efforts = vec![ReasoningEffortOption {
@@ -911,6 +919,7 @@ fn reasoning_effort_override_skips_models_that_do_not_offer_level() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     with_none.info.supports_reasoning_effort = true;
     with_none.info.reasoning_efforts = vec![ReasoningEffortOption {
@@ -1012,6 +1021,7 @@ fn cli_reasoning_effort_override_only_stamps_supporting_models() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     reasoning_entry.info.supports_reasoning_effort = true;
     prefetched.insert("reasoning-model".to_string(), reasoning_entry);
@@ -1022,6 +1032,7 @@ fn cli_reasoning_effort_override_only_stamps_supporting_models() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     prefetched.insert("plain-model".to_string(), plain_entry);
 
@@ -1065,6 +1076,7 @@ fn make_model_entry(model_id: &str) -> ModelEntry {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     }
 }
 
@@ -1072,6 +1084,18 @@ fn make_prefetched(ids: &[&str]) -> IndexMap<String, ModelEntry> {
     ids.iter()
         .map(|id| (id.to_string(), make_model_entry(id)))
         .collect()
+}
+
+#[test]
+fn tracked_config_generation_stays_unset_until_catalog_projection_exists() {
+    let mgr = test_manager();
+    assert_eq!(mgr.tracked_config_generation(), None);
+    mgr.insert_test_entry("loopback", make_model_entry("loopback"));
+    assert_eq!(mgr.tracked_config_generation(), Some(1));
+    mgr.insert_test_entry("loopback", make_model_entry("loopback"));
+    assert_eq!(mgr.tracked_config_generation(), Some(1));
+    mgr.insert_test_entry("other", make_model_entry("other"));
+    assert_eq!(mgr.tracked_config_generation(), Some(2));
 }
 
 // ── startup background refresh ─────────────────────────────────────
@@ -1934,6 +1958,7 @@ async fn fetch_and_apply_degrades_offline_when_remote_fetch_disabled() {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            model_provider: None,
         },
     );
 
@@ -1962,6 +1987,7 @@ fn default_model_skips_oauth_only_for_api_key_users() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     oauth_only.info.supported_in_api = false;
     catalog.insert("oauth-only".to_string(), oauth_only);
@@ -1972,6 +1998,7 @@ fn default_model_skips_oauth_only_for_api_key_users() {
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     catalog.insert("public-model".to_string(), public);
 

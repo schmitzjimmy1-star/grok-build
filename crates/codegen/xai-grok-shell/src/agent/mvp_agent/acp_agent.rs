@@ -1094,14 +1094,10 @@ impl acp::Agent for MvpAgent {
         if xai_grok_tools::util::hard_budget_environment_present() {
             let prompt_sha256 = hard_budget_prompt_sha256(&arguments.prompt, arguments.meta.as_ref())
                 .map_err(|message| acp::Error::invalid_request().data(message))?;
-            let budget = xai_grok_sampler::HardTokenBudget::from_env()
-                .map_err(|_| {
-                    acp::Error::invalid_request().data("hard-token budget configuration is invalid")
-                })?
-                .ok_or_else(|| {
-                    acp::Error::invalid_request().data("hard-token budget is not armed")
-                })?;
-            let allocation = budget.allocation_contract().ok_or_else(|| {
+            let authority = xai_grok_sampler::active_v3_authority().ok_or_else(|| {
+                acp::Error::invalid_request().data("hard-token v3 authority is not active")
+            })?;
+            let allocation = authority.budget().allocation_contract().ok_or_else(|| {
                 acp::Error::invalid_request().data("hard-token budget allocation is unavailable")
             })?;
             if prompt_sha256 != allocation.prompt_sha256 {

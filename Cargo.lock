@@ -13838,6 +13838,7 @@ dependencies = [
  "xai-grok-config",
  "xai-grok-pager",
  "xai-grok-pager-minimal",
+ "xai-grok-sampler",
  "xai-grok-sandbox",
  "xai-grok-shell",
  "xai-grok-telemetry",
@@ -13846,6 +13847,7 @@ dependencies = [
  "xai-grok-version",
  "xai-grok-workspace",
  "xai-tty-utils",
+ "zeroize",
 ]
 
 [[package]]
@@ -14013,6 +14015,7 @@ dependencies = [
  "xai-grok-sampling-types",
  "xai-grok-test-support",
  "xai-grok-version",
+ "zeroize",
 ]
 
 [[package]]
