@@ -55,11 +55,16 @@ The 4B.0 artifact is expected to report `unsigned` or `adHoc`; neither is a
 trusted signing identity. A later slice must require
 strict signing, Team Identifier `DD2GCQJVB4`, and the exact designated
 requirement before the app may select a candidate. An unsigned or ad-hoc
-staging artifact is not an armable runtime. Byte reproducibility is accepted
-only when two package/profile-clean builds from the same committed worktree,
-target root, and macOS host produce identical binary and manifest digests.
-This receipt does not claim cross-host reproducibility: schema v1 does not bind
-the Xcode SDK/linker, and the unstripped line-table debug data is path-sensitive.
+staging artifact is not an armable runtime. 4B.0 does not claim whole-binary
+byte reproducibility, even for same-host clean builds. Acceptance compares the
+canonical source/toolchain/build identity
+projection from two independent manifests byte-for-byte; each full manifest
+separately binds the exact binary digest, size, build string, architecture, and
+observed signing state for its own artifact. The retained upstream cryptify
+flow macro intentionally randomizes compile-time dummy control flow, and schema
+v1 also does not bind the Xcode SDK/linker, so A/B binary and signing fields may
+differ without weakening exact-candidate verification. Never combine the
+binary from one candidate with the manifest from the other.
 This candidate also advertises hard-budget capability v3 and ledger v4 after
 the conservative provider-usage settlement repair. The currently merged app
 accepts capability v2 only, so it intentionally rejects this candidate until
