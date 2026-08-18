@@ -1,0 +1,46 @@
+name: GrokBuild hard-budget fork
+
+on:
+  pull_request:
+  push:
+    branches: [main, grokbuild/hard-token-budget]
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-contract:
+    runs-on: macos-15
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/grokbuild-cargo-target
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.94.0
+      - name: Candidate provenance tests
+        run: python3 -m unittest discover -s tools/grokbuild-candidate/tests -p 'test_*.py' -v
+      - name: Prepare private Cargo target
+        run: mkdir -m 700 "$CARGO_TARGET_DIR"
+      - name: Format gate
+        run: cargo fmt --all --check
+      - name: Compile gate
+        run: cargo check --locked -p xai-grok-pager-bin --features release-dist
+      - name: Hard-budget sampler tests
+        run: cargo test --locked -p xai-grok-sampler hard_budget
+      - name: Hard-budget cross-process ledger tests
+        run: cargo test --locked -p xai-grok-sampler --test hard_budget_process
+      - name: Hard-budget agent tests
+        run: cargo test --locked -p xai-grok-agent hard_budget
+      - name: Armed shell tests
+        run: cargo test --locked -p xai-grok-shell --lib hard_budget_
+      - name: Armed pager tests
+        run: cargo test --locked -p xai-grok-pager-bin hard_budget
+      - name: Staged release candidate and provenance
+        env:
+          GROKBUILD_CARGO_TARGET_DIR: ${{ runner.temp }}/grokbuild-cargo-target
+        run: tools/grokbuild-candidate/build_candidate.sh "$RUNNER_TEMP/grokbuild-candidates"

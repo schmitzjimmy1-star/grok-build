@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grokbuild.local/schema/candidate-provenance-v1.json",
+  "title": "GrokBuild Candidate Provenance V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "source", "toolchain", "build", "binary", "signing"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["officialBaseSHA", "upstreamReplayBaseSHA", "forkSourceSHA", "sourceRev", "cargoLockSHA256"],
+      "properties": {
+        "officialBaseSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "upstreamReplayBaseSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "forkSourceSHA": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "sourceRev": {"type": "string", "minLength": 1},
+        "cargoLockSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustVersion", "cargoVersion", "targetTriple", "architecture"],
+      "properties": {
+        "rustVersion": {"type": "string", "minLength": 1},
+        "cargoVersion": {"type": "string", "minLength": 1},
+        "targetTriple": {"type": "string", "minLength": 1},
+        "architecture": {"enum": ["arm64", "x86_64"]}
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "profile", "package", "features"],
+      "properties": {
+        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "profile": {"const": "release-dist"},
+        "package": {"const": "xai-grok-pager-bin"},
+        "features": {"const": ["release-dist"]}
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactName", "sha256", "sizeBytes", "architecture", "expectedVersionWithCommit", "expectedACPCLIBuild", "observedVersionWithCommit"],
+      "properties": {
+        "artifactName": {"const": "xai-grok-pager"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sizeBytes": {"type": "integer", "minimum": 1},
+        "architecture": {"enum": ["arm64", "x86_64"]},
+        "expectedVersionWithCommit": {"type": "string", "minLength": 1},
+        "expectedACPCLIBuild": {"type": "string", "minLength": 1},
+        "observedVersionWithCommit": {"type": "string", "minLength": 1}
+      }
+    },
+    "signing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "strictVerification", "teamIdentifier", "designatedRequirement"],
+      "properties": {
+        "state": {"enum": ["unsigned", "adHoc", "signed", "unsupported"]},
+        "strictVerification": {"type": "boolean"},
+        "teamIdentifier": {"type": ["string", "null"]},
+        "designatedRequirement": {"type": ["string", "null"]}
+      }
+    }
+  }
+}
