@@ -186,10 +186,9 @@ mod tests {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     use xai_grok_sampler::{
         CandidateIdentityV1, HardTokenAllocationContract, HardTokenRouteContract,
-        HardTokenV3RuntimeBinding, ResolvedConfigIdentityTracker,
-        active_v3_authority, discard_unclaimed_measured_candidate_identity,
-        install_measured_candidate_identity, live_serializer_payload_ceiling_bytes,
-        reset_active_v3_authority_for_test,
+        HardTokenV3RuntimeBinding, ResolvedConfigIdentityTracker, active_v3_authority,
+        discard_unclaimed_measured_candidate_identity, install_measured_candidate_identity,
+        live_serializer_payload_ceiling_bytes, reset_active_v3_authority_for_test,
     };
 
     #[test]
@@ -400,8 +399,9 @@ mod tests {
         ) -> HardTokenV3RuntimeBinding {
             let entry = resolved.get("via-gateway").expect("gateway model");
             let projection = credential_free_model_projection(resolved);
-            let route = observe_live_resolved_route(entry, Some(envelope_ceiling), Some(envelope_calls))
-                .expect("live route");
+            let route =
+                observe_live_resolved_route(entry, Some(envelope_ceiling), Some(envelope_calls))
+                    .expect("live route");
             let sampler = credential_free_sampler_config(entry);
             let source_kind = selected_model_source_kind(entry)
                 .expect("managed provider source kind")
@@ -571,7 +571,8 @@ mod tests {
             bind_measured_v3_authority_if_present(&resolved, "via-gateway", Some(1)).unwrap();
             assert!(active_v3_authority().is_some());
 
-            let projection = String::from_utf8(credential_free_model_projection(&resolved)).unwrap();
+            let projection =
+                String::from_utf8(credential_free_model_projection(&resolved)).unwrap();
             assert!(!projection.contains("sk-must-not-appear"));
             assert!(!projection.contains("apiKey"));
             let sampler = credential_free_sampler_config(resolved.get("via-gateway").unwrap());
