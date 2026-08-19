@@ -66,7 +66,8 @@ pub use hard_budget::{
     HardTokenBudgetError, HardTokenBudgetStatus, HardTokenReceiptQuery, HardTokenReceiptSnapshot,
     HardTokenReceiptTerminalState, HardTokenReservationReceipt, HardTokenRouteContract,
     HardTokenV3RuntimeBinding, V3AuthorityBuilder, active_v3_authority,
-    bind_and_install_v3_authority, install_active_v3_authority, require_registered_v3_authority,
+    bind_and_install_v3_authority, install_active_v3_authority,
+    require_registered_v3_authority, reset_active_v3_authority_for_test,
 };
 pub use hard_budget_provenance::{
     CampaignPolicyV3, CandidateIdentityV1, HardTokenBoundProvenanceV1, HardTokenProvenanceError,
