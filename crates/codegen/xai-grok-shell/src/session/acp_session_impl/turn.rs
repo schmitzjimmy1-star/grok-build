@@ -1093,8 +1093,7 @@ impl SessionActor {
                     written_repo_paths: Vec::new(),
                     cancellation_category: None,
                     cancellation_context: None,
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Completed,
@@ -1123,8 +1122,7 @@ impl SessionActor {
                         crate::session::commands::ACTION_STATIONARITY_CATEGORY.to_string(),
                     ),
                     cancellation_context: None,
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Completed,
@@ -1156,8 +1154,7 @@ impl SessionActor {
                     written_repo_paths: Vec::new(),
                     cancellation_category: cancellation_category_to_wire_string(*category),
                     cancellation_context: context.clone(),
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Cancelled,
@@ -1192,8 +1189,7 @@ impl SessionActor {
                         "reason": "max_turns_reached",
                         "limit": limit,
                     })),
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Cancelled,
@@ -1218,8 +1214,7 @@ impl SessionActor {
                     written_repo_paths: Vec::new(),
                     cancellation_category: None,
                     cancellation_context: None,
-                })
-                .await;
+                });
                 let error_category = Self::classify_turn_error(err);
                 xai_grok_telemetry::session_ctx::log_session_event(
                     xai_grok_telemetry::events::ApiError {
