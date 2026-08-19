@@ -96,7 +96,13 @@ fn capability() -> BudgetCapability {
         configuration_valid,
         enforcement_point: "sampler-pre-dispatch",
         ledger_version: 4,
-        bound_method_version: 3,
+        bound_method_version: if provenance.is_some() {
+            3
+        } else if armed {
+            1
+        } else {
+            3
+        },
         durable: true,
         process_shared: true,
         receipt_projection: armed,
@@ -105,46 +111,58 @@ fn capability() -> BudgetCapability {
         no_automatic_retry: provenance
             .as_ref()
             .is_some_and(|value| value.route.retry_disabled),
-        sampler_transport_retries_disabled: provenance.as_ref().is_some_and(|value| {
+        sampler_transport_retries_disabled: provenance.as_ref().map_or(armed, |value| {
             value
                 .route
                 .tool_isolation
                 .sampler_transport_retries_disabled
         }),
-        auth_provider_helpers_disabled: provenance
-            .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.auth_provider_helpers_disabled),
+        auth_provider_helpers_disabled: provenance.as_ref().map_or(armed, |value| {
+            value.route.tool_isolation.auth_provider_helpers_disabled
+        }),
         terminal_disabled: provenance
             .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.terminal_disabled),
-        external_mcp_disabled: provenance
-            .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.external_mcp_disabled),
+            .map_or(armed, |value| value.route.tool_isolation.terminal_disabled),
+        external_mcp_disabled: provenance.as_ref().map_or(armed, |value| {
+            value.route.tool_isolation.external_mcp_disabled
+        }),
         hooks_disabled: provenance
             .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.hooks_disabled),
+            .map_or(armed, |value| value.route.tool_isolation.hooks_disabled),
         plugins_disabled: provenance
             .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.plugins_disabled),
+            .map_or(armed, |value| value.route.tool_isolation.plugins_disabled),
         lsp_disabled: provenance
             .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.lsp_disabled),
+            .map_or(armed, |value| value.route.tool_isolation.lsp_disabled),
         workflows_disabled: provenance
             .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.workflows_disabled),
+            .map_or(armed, |value| value.route.tool_isolation.workflows_disabled),
         scheduler_disabled: provenance
             .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.scheduler_disabled),
-        protected_authority_fs: provenance
-            .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.protected_authority_fs),
-        workspace_fs_confined: provenance
-            .as_ref()
-            .is_some_and(|value| value.route.tool_isolation.workspace_fs_confined),
+            .map_or(armed, |value| value.route.tool_isolation.scheduler_disabled),
+        protected_authority_fs: provenance.as_ref().map_or(armed, |value| {
+            value.route.tool_isolation.protected_authority_fs
+        }),
+        workspace_fs_confined: provenance.as_ref().map_or(armed, |value| {
+            value.route.tool_isolation.workspace_fs_confined
+        }),
         allowed_tool_ids: provenance
             .as_ref()
             .map(|value| value.route.tool_isolation.allowed_tool_ids.clone())
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                if armed {
+                    vec![
+                        "GrokBuild:read_file".into(),
+                        "GrokBuild:task".into(),
+                        "GrokBuild:get_task_output".into(),
+                        "GrokBuild:wait_tasks".into(),
+                        "GrokBuild:kill_task".into(),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            }),
         cli_build: xai_grok_version::full_version().to_string(),
         v3_authority: provenance.as_ref().and_then(v3_authority_from_provenance),
         status,
@@ -173,16 +191,48 @@ fn capability() -> BudgetCapability {
                 Some("status-unavailable"),
             ),
         },
-        None if xai_grok_tools::util::hard_budget_environment_present() => base(
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            Some("authority-not-active"),
-        ),
-        None => base(false, true, None, None, None, None, None),
+        None => match xai_grok_sampler::HardTokenBudget::from_env() {
+            Ok(Some(budget)) => match budget.status() {
+                Ok(status) => base(
+                    true,
+                    true,
+                    Some(status),
+                    budget.route_contract().cloned(),
+                    budget.allocation_contract().cloned(),
+                    None,
+                    None,
+                ),
+                Err(_) => base(
+                    true,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("status-unavailable"),
+                ),
+            },
+            Ok(None) => base(false, true, None, None, None, None, None),
+            Err(xai_grok_sampler::HardTokenBudgetError::ActiveAuthorityUnavailable) => base(
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                Some("authority-not-active"),
+            ),
+            Err(_) if xai_grok_tools::util::hard_budget_environment_present() => base(
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                Some("configuration-invalid"),
+            ),
+            Err(_) => base(false, true, None, None, None, None, None),
+        },
     }
 }
 
@@ -197,26 +247,32 @@ pub async fn handle(args: &acp::ExtRequest) -> ExtResult {
                     "receipt query must bind campaign, manifest, allocation, packet, and baseline",
                 )
                 })?;
-            let authority = xai_grok_sampler::active_v3_authority().ok_or_else(|| {
-                acp::Error::invalid_request().data("hard-token v3 authority is not active")
+            let budget = if let Some(authority) = xai_grok_sampler::active_v3_authority() {
+                authority.budget().clone()
+            } else {
+                xai_grok_sampler::HardTokenBudget::from_env()
+                    .map_err(|_| {
+                        acp::Error::invalid_request().data("hard-token budget is unavailable")
+                    })?
+                    .ok_or_else(|| {
+                        acp::Error::invalid_request().data("hard-token budget is not armed")
+                    })?
+            };
+            let snapshot = budget.receipts(&query).map_err(|error| match error {
+                xai_grok_sampler::HardTokenBudgetError::ReceiptContractMismatch => {
+                    acp::Error::invalid_request().data(
+                        "receipt query does not match the immutable hard-token budget contract",
+                    )
+                }
+                xai_grok_sampler::HardTokenBudgetError::ReceiptBaselineInvalid => {
+                    acp::Error::invalid_request().data(
+                        "receipt baseline is invalid for the current hard-token budget ledger",
+                    )
+                }
+                _ => {
+                    acp::Error::invalid_request().data("hard-token budget receipts are unavailable")
+                }
             })?;
-            let snapshot = authority
-                .budget()
-                .receipts(&query)
-                .map_err(|error| match error {
-                    xai_grok_sampler::HardTokenBudgetError::ReceiptContractMismatch => {
-                        acp::Error::invalid_request().data(
-                            "receipt query does not match the immutable hard-token budget contract",
-                        )
-                    }
-                    xai_grok_sampler::HardTokenBudgetError::ReceiptBaselineInvalid => {
-                        acp::Error::invalid_request().data(
-                            "receipt baseline is invalid for the current hard-token budget ledger",
-                        )
-                    }
-                    _ => acp::Error::invalid_request()
-                        .data("hard-token budget receipts are unavailable"),
-                })?;
             to_raw_response(&snapshot)
         }
         _ => Err(acp::Error::method_not_found()),
@@ -262,7 +318,7 @@ mod tests {
         let value = capability_value();
         assert_eq!(value["armed"], serde_json::json!(false));
         assert_eq!(value["configurationValid"], serde_json::json!(false));
-        assert_eq!(value["error"], "authority-not-active");
+        assert_eq!(value["error"], "configuration-invalid");
         assert!(value.get("v3Authority").is_none() || value["v3Authority"].is_null());
         assert!(value.get("provenance").is_none() || value["provenance"].is_null());
         assert!(value.get("campaignPolicy").is_none() || value["campaignPolicy"].is_null());
