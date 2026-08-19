@@ -132,9 +132,7 @@ pub(crate) fn bind_measured_v3_authority_if_present(
     }
 
     let builder = match V3AuthorityBuilder::from_env() {
-        Ok(None) => {
-            return Err(HardTokenBudgetError::IncompleteEnvironment.to_string());
-        }
+        Ok(None) | Err(HardTokenBudgetError::IncompleteEnvironment) => return Ok(()),
         Err(HardTokenBudgetError::LegacyManifestRefused) => return Ok(()),
         Err(error) => return Err(error.to_string()),
         Ok(Some(builder)) => builder,
@@ -316,6 +314,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
 
+        use serial_test::serial;
         use xai_grok_sampler::{CampaignPolicyV3, HardTokenV3RuntimeBinding};
 
         struct EnvRestore {
@@ -488,6 +487,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn bind_measured_v3_authority_if_present_skips_legacy_v1_manifest() {
             let _cleanup = TestCleanup;
             let dir = private_dir("skip-v1");
@@ -521,6 +521,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn bind_measured_v3_authority_if_present_refuses_missing_measured_candidate() {
             let _cleanup = TestCleanup;
             let resolved = gateway_catalog();
@@ -548,6 +549,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn bind_measured_v3_authority_if_present_binds_matching_measured_snapshot_once() {
             let _cleanup = TestCleanup;
             let resolved = gateway_catalog();
