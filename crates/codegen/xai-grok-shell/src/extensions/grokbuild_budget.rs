@@ -146,9 +146,7 @@ fn capability() -> BudgetCapability {
             .map(|value| value.route.tool_isolation.allowed_tool_ids.clone())
             .unwrap_or_default(),
         cli_build: xai_grok_version::full_version().to_string(),
-        v3_authority: provenance
-            .as_ref()
-            .and_then(v3_authority_from_provenance),
+        v3_authority: provenance.as_ref().and_then(v3_authority_from_provenance),
         status,
         route,
         allocation,

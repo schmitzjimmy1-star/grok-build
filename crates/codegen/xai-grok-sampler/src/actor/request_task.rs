@@ -445,9 +445,7 @@ async fn apply_retry_decision(
                 match SamplingClient::from_process_config(http1_config) {
                     Ok(fresh) => {
                         *client = fresh;
-                        tracing::info!(
-                            "rebuilt sampling client with HTTP/1.1 fallback for retry"
-                        );
+                        tracing::info!("rebuilt sampling client with HTTP/1.1 fallback for retry");
                     }
                     Err(rebuild_err) => {
                         tracing::warn!(

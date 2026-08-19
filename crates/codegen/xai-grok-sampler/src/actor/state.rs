@@ -112,9 +112,11 @@ pub(crate) fn acquire_request_client(
                 .as_ref()
                 .is_some_and(|bound| armed_route_drifted(bound, &config))
             {
-                return Err(xai_grok_sampling_types::SamplingError::InvalidConfiguration(
-                    "armed v3 rejects route-changing sampler updates",
-                ));
+                return Err(
+                    xai_grok_sampling_types::SamplingError::InvalidConfiguration(
+                        "armed v3 rejects route-changing sampler updates",
+                    ),
+                );
             }
             return Ok(client.clone());
         }

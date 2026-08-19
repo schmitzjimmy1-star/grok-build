@@ -619,10 +619,7 @@ mod tests {
             snapshot.binding().config_identity.managed_provider_id,
             "openrouter"
         );
-        assert_eq!(
-            snapshot.binding().route.provider_facing_model,
-            "test-model"
-        );
+        assert_eq!(snapshot.binding().route.provider_facing_model, "test-model");
         assert!(snapshot.sampler_config().api_key.is_none());
         assert_eq!(snapshot.sampler_config().max_retries, Some(0));
         assert!(crate::hard_budget::active_v3_authority().is_none());

@@ -150,17 +150,11 @@ fn sha256_descriptor(descriptor: RawFd, size: u64) -> Result<String, CandidateId
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 65_536];
     let mut offset: libc::off_t = 0;
-    let total = libc::off_t::try_from(size).map_err(|_| CandidateIdentityError::UnsafeDescriptor)?;
+    let total =
+        libc::off_t::try_from(size).map_err(|_| CandidateIdentityError::UnsafeDescriptor)?;
     while offset < total {
         let want = std::cmp::min((total - offset) as usize, buffer.len());
-        let read = unsafe {
-            libc::pread(
-                descriptor,
-                buffer.as_mut_ptr().cast(),
-                want,
-                offset,
-            )
-        };
+        let read = unsafe { libc::pread(descriptor, buffer.as_mut_ptr().cast(), want, offset) };
         if read <= 0 {
             return Err(CandidateIdentityError::UnsafeDescriptor);
         }
@@ -178,8 +172,13 @@ mod tests {
     #[test]
     fn unarmed_does_not_touch_missing_identity_fd() {
         assert_eq!(
-            consume_measured_candidate_from_fd(false, CANDIDATE_IDENTITY_FD, "build", &"b".repeat(40))
-                .unwrap(),
+            consume_measured_candidate_from_fd(
+                false,
+                CANDIDATE_IDENTITY_FD,
+                "build",
+                &"b".repeat(40)
+            )
+            .unwrap(),
             None
         );
     }
@@ -200,8 +199,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn armed_read_only_regular_file_hashes_and_closes() {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         use std::os::fd::IntoRawFd;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let dir = std::env::temp_dir().join(format!(
             "grok-candidate-identity-{}-{}",
@@ -239,8 +238,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn armed_hard_linked_identity_fd_refuses() {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         use std::os::fd::IntoRawFd;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let dir = std::env::temp_dir().join(format!(
             "grok-candidate-identity-link-{}-{}",

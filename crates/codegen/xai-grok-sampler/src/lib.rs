@@ -42,16 +42,14 @@ pub use armed_credential::{
     ArmedCredentialError, ArmedCredentialOwner, discard_unclaimed_armed_credential_owner,
     install_armed_credential_owner,
 };
+pub use attribution::{
+    Auth401AttributionCallback, BEARER_SUFFIX_LEN, SamplingConsumer, SharedAttributionCallback,
+};
+#[cfg(unix)]
+pub use candidate_identity::{CANDIDATE_IDENTITY_FD, consume_measured_candidate_if_armed};
 pub use candidate_identity::{
     CandidateIdentityError, claim_measured_candidate_identity,
     discard_unclaimed_measured_candidate_identity, install_measured_candidate_identity,
-};
-#[cfg(unix)]
-pub use candidate_identity::{
-    CANDIDATE_IDENTITY_FD, consume_measured_candidate_if_armed,
-};
-pub use attribution::{
-    Auth401AttributionCallback, BEARER_SUFFIX_LEN, SamplingConsumer, SharedAttributionCallback,
 };
 pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
 pub use config::{

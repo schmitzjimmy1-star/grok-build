@@ -613,10 +613,7 @@ pub(crate) fn is_exact_loopback_base_url(base_url: &str) -> bool {
     }
 }
 
-pub(crate) fn exact_loopback_endpoint_sha256(
-    base_url: &str,
-    api_backend: &str,
-) -> Option<String> {
+pub(crate) fn exact_loopback_endpoint_sha256(base_url: &str, api_backend: &str) -> Option<String> {
     if !is_exact_loopback_base_url(base_url) || base_url.contains('?') {
         return None;
     }
@@ -4393,8 +4390,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            let _authority =
-                crate::hard_budget::v3_test_support::activate_with_route(&dir, route);
+            let _authority = crate::hard_budget::v3_test_support::activate_with_route(&dir, route);
             let client = SamplingClient::new_with_armed_v3(armed_loopback_config(loopback))
                 .expect("registered authority plus one-shot owner must construct");
             let mut present = Vec::new();
@@ -4597,8 +4593,10 @@ mod tests {
         install_fake_loopback_owner();
         let _authority = crate::hard_budget::v3_test_support::activate_with_route(&dir, live);
         assert!(
-            SamplingClient::new_with_armed_v3(armed_loopback_config("http://127.0.0.1:9/v1".into()))
-                .is_err()
+            SamplingClient::new_with_armed_v3(armed_loopback_config(
+                "http://127.0.0.1:9/v1".into()
+            ))
+            .is_err()
         );
         assert!(
             SamplingClient::new_with_armed_v3(armed_loopback_config(
@@ -4650,9 +4648,8 @@ mod tests {
         ));
         install_fake_loopback_owner();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let client =
-            SamplingClient::new_with_armed_v3(armed_loopback_config(base_url.clone()))
-                .expect("only the registered ledger may construct the armed client");
+        let client = SamplingClient::new_with_armed_v3(armed_loopback_config(base_url.clone()))
+            .expect("only the registered ledger may construct the armed client");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(SamplingClient::new_with_armed_v3(armed_loopback_config(base_url)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);

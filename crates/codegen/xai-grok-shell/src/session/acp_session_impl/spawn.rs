@@ -137,9 +137,8 @@ mod cli_catchall_drop_tests {
     }
     #[test]
     fn spawn_requires_already_active_authority_and_does_not_reopen_env() {
-        let err = super::require_active_hard_budget_authority().expect_err(
-            "this libtest process does not install v3 authority",
-        );
+        let err = super::require_active_hard_budget_authority()
+            .expect_err("this libtest process does not install v3 authority");
         let msg = err.to_string();
         assert!(
             msg.contains("hard-token v3 authority is not active"),

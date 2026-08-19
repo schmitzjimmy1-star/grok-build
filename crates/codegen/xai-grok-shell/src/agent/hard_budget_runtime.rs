@@ -12,8 +12,7 @@ use super::config::ModelEntry;
 use xai_grok_sampler::{
     ArmedV3LiveRouteCore, ArmedV3PacketBoundsObservation, ArmedV3ResolutionError,
     ArmedV3RouteCoreObservation, live_api_backend_label, live_auth_scheme_label,
-    live_hard_budget_isolated_tool_ids, observed_managed_source_kind,
-    observed_max_output_tokens,
+    live_hard_budget_isolated_tool_ids, observed_managed_source_kind, observed_max_output_tokens,
 };
 
 #[derive(Serialize)]
@@ -144,10 +143,7 @@ mod tests {
         assert_eq!(tracker.observe(&projection), Some(1));
 
         let mut drifted = resolved.clone();
-        drifted
-            .get_mut("via-gateway")
-            .unwrap()
-            .model_provider = Some("other".into());
+        drifted.get_mut("via-gateway").unwrap().model_provider = Some("other".into());
         let drifted_projection = credential_free_model_projection(&drifted);
         assert_eq!(tracker.observe(&drifted_projection), Some(2));
     }

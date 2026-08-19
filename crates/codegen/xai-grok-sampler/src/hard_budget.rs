@@ -2543,9 +2543,8 @@ mod tests {
         };
 
         for artifact in ["manifest", "ledger", "lock"] {
-            let dir = crate::hard_budget::v3_test_support::private_dir(&format!(
-                "hard-link-{artifact}"
-            ));
+            let dir =
+                crate::hard_budget::v3_test_support::private_dir(&format!("hard-link-{artifact}"));
             let route = crate::hard_budget::v3_test_support::route();
             let actual = crate::hard_budget::v3_test_support::binding(route.clone());
             let manifest = crate::hard_budget::v3_test_support::write_manifest(&dir, route);
