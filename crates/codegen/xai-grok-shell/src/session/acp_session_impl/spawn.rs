@@ -63,13 +63,19 @@ fn configured_memory_retrieval_mode(
     }
 }
 
-fn require_active_hard_budget_authority() -> Result<(), xai_grok_agent::AgentBuildError> {
-    if xai_grok_sampler::active_v3_authority().is_none() {
-        return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
-            "hard-token v3 authority is not active".to_string(),
-        ));
+fn require_hard_budget_contract() -> Result<(), xai_grok_agent::AgentBuildError> {
+    if xai_grok_sampler::active_v3_authority().is_some() {
+        return Ok(());
     }
-    Ok(())
+    match xai_grok_sampler::HardTokenBudget::from_env() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(xai_grok_agent::AgentBuildError::InvalidConfig(
+            "hard-token-budget restriction is active without a complete contract".to_string(),
+        )),
+        Err(error) => Err(xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+            "hard-token-budget contract is invalid: {error}"
+        ))),
+    }
 }
 
 fn hard_budget_authority_roots() -> Result<Vec<std::path::PathBuf>, xai_grok_agent::AgentBuildError>
@@ -136,14 +142,11 @@ mod cli_catchall_drop_tests {
         assert_eq!(dropped.len(), 2, "both catch-alls are dropped");
     }
     #[test]
-    fn spawn_requires_already_active_authority_and_does_not_reopen_env() {
-        let err = super::require_active_hard_budget_authority()
-            .expect_err("this libtest process does not install v3 authority");
+    fn spawn_gate_accepts_live_v1_or_active_v3_and_refuses_empty_env() {
+        let err = super::require_hard_budget_contract()
+            .expect_err("this libtest process has no hard-budget contract");
         let msg = err.to_string();
-        assert!(
-            msg.contains("hard-token v3 authority is not active"),
-            "{msg}"
-        );
+        assert!(msg.contains("without a complete contract"), "{msg}");
     }
 
     /// Without the pin nothing is dropped, even catch-alls.
@@ -328,7 +331,7 @@ pub(crate) async fn spawn_session_actor(
         feedback_flags
     };
     let (hard_budget_authority_roots, hard_budget_workspace_root) = if hard_budget_restricted {
-        require_active_hard_budget_authority()?;
+        require_hard_budget_contract()?;
         let roots = hard_budget_authority_roots()?;
         let workspace = std::fs::canonicalize(tool_context.cwd.as_path()).map_err(|error| {
             xai_grok_agent::AgentBuildError::InvalidConfig(format!(

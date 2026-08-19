@@ -30,7 +30,6 @@ use crate::hard_budget_provenance::{
 };
 
 const LEDGER_VERSION: u32 = 4;
-#[cfg(test)]
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_V3_SCHEMA_VERSION: u32 = 3;
 const ENV_LEDGER: &str = "GROK_HARD_TOKEN_BUDGET_LEDGER";
@@ -141,7 +140,6 @@ pub struct HardTokenAllocationContract {
     pub route: HardTokenRouteContract,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HardTokenCampaignManifest {
@@ -558,21 +556,38 @@ pub fn bind_and_install_v3_authority(
 }
 
 impl HardTokenBudget {
-    /// Legacy compatibility shim. An armed environment is no longer sufficient
-    /// to produce a bare budget: only `V3AuthorityBuilder::from_env` may load
-    /// v3 authority, and it still must bind the actual CLI runtime before a
-    /// governed client can exist. Historical v1 manifests always refuse.
+    /// Resolve the all-or-nothing process contract.
+    ///
+    /// Live 4M/3M/1M packets still load a v1 governor here. A complete v3
+    /// environment is not a bare budget: that path requires
+    /// `bind_and_install_v3_authority` before any governed client exists.
     pub fn from_env() -> Result<Option<Self>, HardTokenBudgetError> {
-        match V3AuthorityBuilder::from_env()? {
-            None => Ok(None),
-            Some(_) => Err(HardTokenBudgetError::ActiveAuthorityUnavailable),
+        match V3AuthorityBuilder::from_env() {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => Err(HardTokenBudgetError::ActiveAuthorityUnavailable),
+            Err(HardTokenBudgetError::LegacyManifestRefused) => {
+                let values = (
+                    std::env::var_os(ENV_LEDGER),
+                    std::env::var_os(ENV_MANIFEST),
+                    std::env::var(ENV_ALLOCATION).ok(),
+                );
+                match values {
+                    (Some(ledger), Some(manifest), Some(allocation_id)) => {
+                        Self::open_with_manifest(
+                            PathBuf::from(ledger),
+                            PathBuf::from(manifest),
+                            &allocation_id,
+                        )
+                        .map(Some)
+                    }
+                    _ => Err(HardTokenBudgetError::IncompleteEnvironment),
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
-    /// Historical v1 decode support for unit migration tests only. It is not
-    /// compiled into production and cannot activate an armed process.
-    #[cfg(test)]
-    pub(crate) fn open_legacy_with_manifest_for_test(
+    pub fn open_with_manifest(
         ledger_path: PathBuf,
         manifest_path: PathBuf,
         allocation_id: &str,
@@ -591,16 +606,6 @@ impl HardTokenBudget {
             manifest_sha256,
             Some(allocation),
         )
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn open_with_manifest(
-        ledger_path: PathBuf,
-        manifest_path: PathBuf,
-        allocation_id: &str,
-    ) -> Result<Self, HardTokenBudgetError> {
-        Self::open_legacy_with_manifest_for_test(ledger_path, manifest_path, allocation_id)
     }
 
     #[cfg(test)]
@@ -1191,7 +1196,6 @@ fn validate_allocation(
     Ok(())
 }
 
-#[cfg(test)]
 fn load_manifest(path: &Path) -> Result<(HardTokenCampaignManifest, String), HardTokenBudgetError> {
     if !path.is_absolute() {
         return Err(HardTokenBudgetError::RelativeLedgerPath);
@@ -2447,6 +2451,57 @@ mod tests {
             HardTokenBudget::from_env(),
             Err(HardTokenBudgetError::ActiveAuthorityUnavailable)
         ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn from_env_loads_complete_v1_live_manifest() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let dir = private_dir("from-env-v1");
+        let mut live = allocation("packet-a", "model-a", 600);
+        live.token_ceiling = 3_000_000;
+        live.max_model_calls = 1;
+        let manifest = write_manifest(&dir, 4_000_000, vec![live]);
+        let ledger = dir.join("ledger.json");
+        struct EnvRestore {
+            ledger: Option<std::ffi::OsString>,
+            manifest: Option<std::ffi::OsString>,
+            allocation: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.ledger {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+                    }
+                    match &self.manifest {
+                        Some(value) => std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", value),
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+                    }
+                    match &self.allocation {
+                        Some(value) => {
+                            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", value)
+                        }
+                        None => std::env::remove_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+                    }
+                }
+            }
+        }
+        let _env = EnvRestore {
+            ledger: std::env::var_os("GROK_HARD_TOKEN_BUDGET_LEDGER"),
+            manifest: std::env::var_os("GROK_HARD_TOKEN_BUDGET_MANIFEST"),
+            allocation: std::env::var_os("GROK_HARD_TOKEN_BUDGET_ALLOCATION"),
+        };
+        unsafe {
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_LEDGER", &ledger);
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_MANIFEST", &manifest);
+            std::env::set_var("GROK_HARD_TOKEN_BUDGET_ALLOCATION", "packet-a");
+        }
+        let budget = HardTokenBudget::from_env()
+            .unwrap()
+            .expect("complete v1 env still loads a live governor");
+        assert_eq!(budget.status().unwrap().ceiling_tokens, 4_000_000);
         fs::remove_dir_all(dir).unwrap();
     }
 
