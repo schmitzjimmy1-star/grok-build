@@ -439,7 +439,9 @@ async fn freeze_timeout_marks_report_and_both_ledgers() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let mut actor = make_actor().await;
-            actor.events.tool_started("GrokBuild:task".into(), "call-1".into(), 0);
+            actor
+                .events
+                .tool_started("GrokBuild:task".into(), "call-1".into(), 0);
             actor.tool_context.subagent_event_tx = Some(scripted_outstanding_responder(vec![
                 SubagentOutstandingReply {
                     live_ids: vec!["wedged".into()],
