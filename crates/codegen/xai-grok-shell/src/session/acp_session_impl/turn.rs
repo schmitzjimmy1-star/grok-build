@@ -1093,8 +1093,7 @@ impl SessionActor {
                     written_repo_paths: Vec::new(),
                     cancellation_category: None,
                     cancellation_context: None,
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Completed,
@@ -1123,8 +1122,7 @@ impl SessionActor {
                         crate::session::commands::ACTION_STATIONARITY_CATEGORY.to_string(),
                     ),
                     cancellation_context: None,
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Completed,
@@ -1156,8 +1154,7 @@ impl SessionActor {
                     written_repo_paths: Vec::new(),
                     cancellation_category: cancellation_category_to_wire_string(*category),
                     cancellation_context: context.clone(),
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Cancelled,
@@ -1192,8 +1189,7 @@ impl SessionActor {
                         "reason": "max_turns_reached",
                         "limit": limit,
                     })),
-                })
-                .await;
+                });
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::events::TurnCompleted {
                         outcome: xai_grok_telemetry::events::Outcome::Cancelled,
@@ -1218,8 +1214,7 @@ impl SessionActor {
                     written_repo_paths: Vec::new(),
                     cancellation_category: None,
                     cancellation_context: None,
-                })
-                .await;
+                });
                 let error_category = Self::classify_turn_error(err);
                 xai_grok_telemetry::session_ctx::log_session_event(
                     xai_grok_telemetry::events::ApiError {
@@ -1360,11 +1355,20 @@ impl SessionActor {
     /// prompt report is marked incomplete immediately and their spend reaches
     /// the session ledger when they finish.
     /// Cancel intentionally skips this multi-second drain (actor-loop safety).
+    /// A turn with no tool calls uses the same single-shot Outstanding policy
+    /// as cancel: phantom `live_ids` must not hold ACP `session/prompt` for
+    /// 120s (armed clients time out at 90s). Worker turns that called Task
+    /// still poll until `live_ids` clear.
     pub(super) async fn freeze_prompt_usage(
         &self,
         prompt_id: &str,
     ) -> Option<crate::extensions::notification::PromptUsage> {
         const DRAIN: std::time::Duration = std::time::Duration::from_secs(120);
+        if self.events.tool_count_this_turn() == 0 {
+            let reply = self.outstanding_reply_for_prompt(prompt_id).await;
+            let outcome = UsageDrainOutcome::from_outstanding_reply(reply.as_ref());
+            return self.finalize_usage_from_outcome(prompt_id, outcome).await;
+        }
         self.freeze_prompt_usage_bounded(prompt_id, DRAIN).await
     }
     /// [`freeze_prompt_usage`] with an explicit drain bound, for tests.

@@ -1244,11 +1244,15 @@ impl SessionActor {
             .await;
     }
     /// Send an after-turn hook via the local workspace channel.
-    /// Fire-and-forget — failures are logged but do not interrupt the turn.
-    async fn send_after_turn_event(&self, payload: xai_tool_protocol::turn_hook::AfterTurnPayload) {
-        self.workspace_ops
-            .on_after_turn(&self.session_id_string(), &payload)
-            .await;
+    /// Fire-and-forget: do not await workspace git/enqueue. Awaiting
+    /// `on_after_turn` held ACP `session/prompt` after `handle_prompt.done`
+    /// (armed clients time out at 90s with streamed text but no RPC result).
+    fn send_after_turn_event(&self, payload: xai_tool_protocol::turn_hook::AfterTurnPayload) {
+        let ops = self.workspace_ops.clone();
+        let session_id = self.session_id_string();
+        tokio::task::spawn_local(async move {
+            ops.on_after_turn(&session_id, &payload).await;
+        });
     }
     /// Compute the live command availability snapshot for this session.
     ///
