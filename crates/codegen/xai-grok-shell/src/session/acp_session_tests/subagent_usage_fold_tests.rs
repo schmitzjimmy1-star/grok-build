@@ -399,6 +399,38 @@ async fn freeze_unanswered_outstanding_fail_closes_without_hanging() {
         .await;
 }
 
+/// Zero-tool turn (pong): persistent `live_ids` fail-closed immediately.
+/// Must not poll the 120s drain — armed ACP `session/prompt` times out at 90s.
+#[tokio::test(flavor = "current_thread")]
+async fn freeze_zero_tool_turn_does_not_poll_wedged_live_ids() {
+    use std::time::{Duration, Instant};
+    use xai_grok_tools::implementations::grok_build::task::types::SubagentOutstandingReply;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut actor = make_actor().await;
+            assert_eq!(actor.events.tool_count_this_turn(), 0);
+            actor.tool_context.subagent_event_tx = Some(scripted_outstanding_responder(vec![
+                SubagentOutstandingReply {
+                    live_ids: vec!["phantom".into()],
+                    background_live: false,
+                    subagent_usage_not_applied: false,
+                },
+            ]));
+            let started = Instant::now();
+            let usage = actor
+                .freeze_prompt_usage("p-1")
+                .await
+                .expect("incomplete usage always attaches");
+            let elapsed = started.elapsed();
+            assert!(usage.usage_is_incomplete);
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "zero-tool freeze must not wait the 120s live_ids drain: {elapsed:?}"
+            );
+        })
+        .await;
+}
+
 /// Drain timeout (wedged foreground child) fails closed: the report and both
 /// ledgers are marked incomplete.
 #[tokio::test(flavor = "current_thread")]
@@ -407,6 +439,7 @@ async fn freeze_timeout_marks_report_and_both_ledgers() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let mut actor = make_actor().await;
+            actor.events.tool_started("GrokBuild:task".into(), "call-1".into(), 0);
             actor.tool_context.subagent_event_tx = Some(scripted_outstanding_responder(vec![
                 SubagentOutstandingReply {
                     live_ids: vec!["wedged".into()],
