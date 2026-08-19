@@ -367,6 +367,38 @@ fn scripted_outstanding_responder(
     tx
 }
 
+/// Coordinator channel is live but never answers Outstanding. The oneshot
+/// used to hang `handle_prompt` after `shell.handle_prompt.done`, so ACP
+/// `session/prompt` never returned. Fail-closed inside the query timeout.
+#[tokio::test(flavor = "current_thread")]
+async fn freeze_unanswered_outstanding_fail_closes_without_hanging() {
+    use std::time::{Duration, Instant};
+    use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut actor = make_actor().await;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+            tokio::task::spawn_local(async move {
+                while let Some(event) = rx.recv().await {
+                    let _ = event;
+                }
+            });
+            actor.tool_context.subagent_event_tx = Some(tx);
+            let started = Instant::now();
+            let usage = actor
+                .freeze_prompt_usage_bounded("p-1", Duration::from_secs(30))
+                .await
+                .expect("incomplete usage always attaches");
+            let elapsed = started.elapsed();
+            assert!(usage.usage_is_incomplete);
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "unanswered Outstanding must not wait the 120s drain: {elapsed:?}"
+            );
+        })
+        .await;
+}
+
 /// Drain timeout (wedged foreground child) fails closed: the report and both
 /// ledgers are marked incomplete.
 #[tokio::test(flavor = "current_thread")]
