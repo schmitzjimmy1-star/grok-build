@@ -52,6 +52,11 @@ pub fn bootstrap(
         let _timer = crate::instrumentation_timer!("startup.bootstrap.models_manager");
         ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?
     };
+    crate::agent::hard_budget_runtime::bind_measured_v3_authority_if_present(
+        &models_manager.models(),
+        models_manager.current_model_id().0.as_ref(),
+        models_manager.tracked_config_generation(),
+    )?;
 
     // Refresh on every auth refresh — the FSEvents watcher can silently die after
     // macOS sleep, stranding the catalog on bundled defaults.

@@ -44,8 +44,9 @@ pub struct ArmedV3SnapshotObservation {
     pub sampler: Option<SamplerConfig>,
 }
 
-/// One immutable credential-free snapshot. Production startup still must not
-/// bind this until a tracked config producer exists.
+/// One immutable credential-free snapshot. Shell bootstrap binds only after
+/// independently observing candidate, tracked generation, projection, route,
+/// and credential-free sampler fields through `try_resolve`.
 #[derive(Clone, Debug)]
 pub struct ArmedV3ResolvedSnapshot {
     binding: HardTokenV3RuntimeBinding,

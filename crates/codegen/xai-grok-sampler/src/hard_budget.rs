@@ -439,6 +439,14 @@ impl V3AuthorityBuilder {
         })
     }
 
+    pub fn allocation_token_ceiling(&self) -> u64 {
+        self.allocation.route_expectation.allocation_token_ceiling
+    }
+
+    pub fn max_model_calls(&self) -> u64 {
+        self.allocation.route_expectation.max_model_calls
+    }
+
     /// Bind exactly one live, CLI-produced non-secret identity to the frozen
     /// manifest expectation. The resulting object remains unregistered until
     /// the client installation path calls `install_active_v3_authority`.
@@ -522,6 +530,13 @@ pub fn active_v3_authority() -> Option<ActiveHardTokenV3Authority> {
         .lock()
         .expect("active hard-token v3 authority lock poisoned")
         .clone()
+}
+
+/// Clear the process-wide active v3 authority. Tests only.
+pub fn reset_active_v3_authority_for_test() {
+    *active_v3_slot()
+        .lock()
+        .expect("active hard-token v3 authority lock poisoned") = None;
 }
 
 /// The armed sampler constructor may consume a credential only for the
@@ -1459,9 +1474,7 @@ pub(crate) mod v3_test_support {
     }
 
     pub fn reset() {
-        *active_v3_slot()
-            .lock()
-            .expect("active hard-token v3 authority lock poisoned") = None;
+        reset_active_v3_authority_for_test();
         crate::armed_credential::reset_armed_credential_owner_for_test();
     }
 
@@ -2310,6 +2323,26 @@ mod tests {
             validate_route_contract(&contract),
             Err(HardTokenBudgetError::InvalidRouteContract)
         ));
+    }
+
+    #[test]
+    fn v3_builder_exposes_allocation_packet_bounds_from_manifest() {
+        let _guard = crate::hard_budget::v3_test_support::lock();
+        let dir = crate::hard_budget::v3_test_support::private_dir("builder-bounds");
+        let route = crate::hard_budget::v3_test_support::route();
+        let manifest = crate::hard_budget::v3_test_support::write_manifest(&dir, route.clone());
+        let builder = V3AuthorityBuilder::open_with_manifest(
+            dir.join("ledger.json"),
+            manifest,
+            "allocation-v3",
+        )
+        .unwrap();
+        assert_eq!(
+            builder.allocation_token_ceiling(),
+            route.allocation_token_ceiling
+        );
+        assert_eq!(builder.max_model_calls(), route.max_model_calls);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
