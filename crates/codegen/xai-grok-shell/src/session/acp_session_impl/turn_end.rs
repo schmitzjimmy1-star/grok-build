@@ -138,6 +138,12 @@ impl SessionActor {
     }
 
     /// Live subagents and sticky usage-not-applied. `None` if the query failed.
+    /// Per-query bound for the coordinator oneshot. The 120s drain budget only
+    /// starts after this returns; an unanswered oneshot used to hang
+    /// `session/prompt` forever (armed ACP clients time out at 90s with no
+    /// `TurnCompleted`). A live coordinator replies in well under this window.
+    const OUTSTANDING_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
     pub(super) async fn outstanding_reply_for_prompt(
         &self,
         prompt_id: &str,
@@ -160,7 +166,18 @@ impl SessionActor {
         {
             return None;
         }
-        rx.await.ok()
+        match tokio::time::timeout(Self::OUTSTANDING_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => Some(reply),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                tracing::warn!(
+                    prompt_id,
+                    timeout_ms = Self::OUTSTANDING_REPLY_TIMEOUT.as_millis() as u64,
+                    "outstanding subagent query timed out; treating usage as incomplete"
+                );
+                None
+            }
+        }
     }
 
     /// Report-level incomplete (error-path attach, tests). Same OR as

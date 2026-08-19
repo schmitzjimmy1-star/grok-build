@@ -77,6 +77,11 @@ impl ActorState {
     /// an override will use this. Armed v3 ignores route-changing updates
     /// so a later model/host switch cannot replace the bound client.
     pub(crate) fn update_config(&mut self, config: SamplerConfig) {
+        let config = if crate::hard_budget::active_v3_authority().is_some() {
+            config.into_credential_free_armed_turn()
+        } else {
+            config
+        };
         if self.armed_client.is_some()
             && self
                 .armed_config
@@ -95,10 +100,6 @@ pub(crate) fn armed_route_drifted(bound: &SamplerConfig, incoming: &SamplerConfi
         || bound.model != incoming.model
         || bound.api_backend != incoming.api_backend
         || bound.auth_scheme != incoming.auth_scheme
-        || bound.api_key.is_some() != incoming.api_key.is_some()
-        || bound.extra_headers != incoming.extra_headers
-        || bound.query_params != incoming.query_params
-        || bound.env_http_headers != incoming.env_http_headers
 }
 
 pub(crate) fn acquire_request_client(
@@ -106,6 +107,7 @@ pub(crate) fn acquire_request_client(
     config: SamplerConfig,
 ) -> Result<SamplingClient, xai_grok_sampling_types::SamplingError> {
     if crate::hard_budget::active_v3_authority().is_some() {
+        let config = config.into_credential_free_armed_turn();
         if let Some(client) = &state.armed_client {
             if state
                 .armed_config
@@ -245,6 +247,54 @@ mod tests {
         assert!(acquire_request_client(&mut state, drifted.clone()).is_err());
         state.update_config(drifted);
         assert_eq!(state.config.base_url, loopback);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn armed_acquire_strips_turn_client_mode_headers_without_route_drift() {
+        use crate::armed_credential::{ArmedCredentialOwner, install_armed_credential_owner};
+        use crate::client::exact_loopback_endpoint_sha256;
+        use crate::config::AuthScheme;
+        use crate::hard_budget::v3_test_support;
+        use zeroize::Zeroizing;
+
+        let _guard = v3_test_support::lock();
+        let dir = v3_test_support::private_dir("actor-armed-client-mode");
+        let loopback = "http://127.0.0.1:9/v1".to_string();
+        let mut route = v3_test_support::route();
+        route.api_backend = "responses".into();
+        route.provider_facing_model = "test-model".into();
+        route.endpoint_sha256 = exact_loopback_endpoint_sha256(&loopback, "responses").unwrap();
+        install_armed_credential_owner(
+            ArmedCredentialOwner::from_receiver(Zeroizing::new(b"fake-sentinel".to_vec())).unwrap(),
+        )
+        .unwrap();
+        let _authority = v3_test_support::activate_with_route(&dir, route);
+        let mut cfg = SamplerConfig {
+            base_url: loopback.clone(),
+            model: "test-model".into(),
+            api_backend: ApiBackend::Responses,
+            auth_scheme: AuthScheme::Bearer,
+            max_retries: Some(0),
+            ..SamplerConfig::default()
+        };
+        cfg.extra_headers
+            .insert("x-grok-client-mode".into(), "pager".into());
+        let mut state = ActorState::new(cfg.clone(), RetryPolicy::default());
+        let first = acquire_request_client(&mut state, cfg.clone())
+            .expect("armed actor must strip client-mode headers before construction");
+        assert!(first.hard_token_budget_enabled());
+        assert!(
+            state
+                .armed_config
+                .as_ref()
+                .is_some_and(|bound| bound.extra_headers.is_empty())
+        );
+        let _second = acquire_request_client(&mut state, cfg.clone())
+            .expect("cached clone must ignore reconstructed client-mode headers");
+        state.update_config(cfg);
+        assert!(state.config.extra_headers.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

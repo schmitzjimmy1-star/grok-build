@@ -175,6 +175,29 @@ impl Default for SamplerConfig {
     }
 }
 
+impl SamplerConfig {
+    /// Drop config, resolver, injector, query, retry, and environment auth so an
+    /// armed v3 turn can construct the bound credential-free sampler.
+    ///
+    /// Bind already refused secret-bearing configs. This only strips the
+    /// unconditional client-mode headers that `sampling_config_for_model`
+    /// injects on every reconstructed turn, which the armed constructor
+    /// otherwise treats as forbidden extra auth.
+    pub fn into_credential_free_armed_turn(mut self) -> Self {
+        self.api_key = None;
+        self.bearer_resolver = None;
+        self.header_injector = None;
+        self.attribution_callback = None;
+        self.doom_loop_recovery = None;
+        self.supports_backend_search = false;
+        self.env_http_headers.clear();
+        self.extra_headers.clear();
+        self.query_params.clear();
+        self.max_retries = Some(0);
+        self
+    }
+}
+
 /// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].
 pub trait BearerResolver: Send + Sync + std::fmt::Debug {
     fn current_bearer(&self) -> Option<String>;
@@ -259,5 +282,23 @@ mod tests {
             round_tripped.doom_loop_recovery,
             with_policy.doom_loop_recovery
         );
+    }
+
+    #[test]
+    fn credential_free_armed_turn_strips_client_mode_headers_and_retries() {
+        let mut config = SamplerConfig::default();
+        config.api_key = Some("sk-test".into());
+        config
+            .extra_headers
+            .insert("x-grok-client-mode".into(), "pager".into());
+        config.query_params.insert("api-version".into(), "1".into());
+        config.max_retries = Some(5);
+        config.supports_backend_search = true;
+        let stripped = config.into_credential_free_armed_turn();
+        assert!(stripped.api_key.is_none());
+        assert!(stripped.extra_headers.is_empty());
+        assert!(stripped.query_params.is_empty());
+        assert_eq!(stripped.max_retries, Some(0));
+        assert!(!stripped.supports_backend_search);
     }
 }
