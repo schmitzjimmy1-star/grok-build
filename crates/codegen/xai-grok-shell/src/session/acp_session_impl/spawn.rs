@@ -1343,6 +1343,9 @@ pub(crate) async fn spawn_session_actor(
     let permissions_for_handle = permissions.clone();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let mut sampler_config_initial = sampling_config.clone();
+    if hard_budget_restricted {
+        sampler_config_initial = sampler_config_initial.into_credential_free_armed_turn();
+    }
     sampler_config_initial.idle_timeout_secs = Some(inference_idle_timeout_secs);
     let task_output_budgeted = tool_context.task_output_token_budget.is_some();
     let retry_only_before_output = hard_budget_restricted
