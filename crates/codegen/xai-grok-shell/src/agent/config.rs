@@ -3552,6 +3552,7 @@ pub(crate) fn resolve_model_list(
         });
         let effective = with_provider.as_ref().unwrap_or(model_override);
         let mut entry = effective.apply(key, base, &cfg.endpoints);
+        entry.model_provider = model_override.model_provider.clone();
         let session_bearer_unsafe = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
             || entry
                 .api_base_url
@@ -4341,6 +4342,10 @@ pub struct ModelEntry {
     pub auth_provider: Option<crate::auth::AuthProviderRef>,
     /// When set, `base_url` is used for session auth, `api_base_url` for API-key auth.
     pub api_base_url: Option<String>,
+    /// `[model.<id>] model_provider = "<id>"` after resolve. Provider defaults
+    /// are merged separately; this keeps the declared managed-provider identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
 }
 impl ModelEntry {
     /// Minimal fallback entry for an unknown model slug.
@@ -4353,6 +4358,7 @@ impl ModelEntry {
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            model_provider: None,
         }
     }
     pub fn info(&self) -> &ModelInfo {
@@ -4365,6 +4371,7 @@ impl ModelEntry {
             env_key: entry.env_key.clone(),
             auth_provider: None,
             api_base_url: entry.api_base_url.clone(),
+            model_provider: None,
         }
     }
     /// Non-empty `api_key`, else first non-empty resolved `env_key`.
@@ -5067,6 +5074,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
             env_key: None,
             auth_provider: None,
             api_base_url: None,
+            model_provider: None,
         };
         let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
         let sampler = sampling_config_for_model(
@@ -5304,6 +5312,7 @@ fn resolve_hidden_default_web_search_sampling_config(
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+        model_provider: None,
     };
     let credentials = resolve_credentials_enforced(&entry, session_key, disable_api_key_auth);
     sampling_config_for_model(

@@ -63,6 +63,15 @@ fn configured_memory_retrieval_mode(
     }
 }
 
+fn require_active_hard_budget_authority() -> Result<(), xai_grok_agent::AgentBuildError> {
+    if xai_grok_sampler::active_v3_authority().is_none() {
+        return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
+            "hard-token v3 authority is not active".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn hard_budget_authority_roots() -> Result<Vec<std::path::PathBuf>, xai_grok_agent::AgentBuildError>
 {
     let mut roots = Vec::new();
@@ -126,6 +135,17 @@ mod cli_catchall_drop_tests {
         assert_eq!(kept[0].tool, ToolFilter::Bash);
         assert_eq!(dropped.len(), 2, "both catch-alls are dropped");
     }
+    #[test]
+    fn spawn_requires_already_active_authority_and_does_not_reopen_env() {
+        let err = super::require_active_hard_budget_authority()
+            .expect_err("this libtest process does not install v3 authority");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hard-token v3 authority is not active"),
+            "{msg}"
+        );
+    }
+
     /// Without the pin nothing is dropped, even catch-alls.
     #[test]
     fn no_pin_keeps_everything() {
@@ -308,38 +328,23 @@ pub(crate) async fn spawn_session_actor(
         feedback_flags
     };
     let (hard_budget_authority_roots, hard_budget_workspace_root) = if hard_budget_restricted {
-        match xai_grok_sampler::HardTokenBudget::from_env() {
-            Ok(Some(_)) => {
-                let roots = hard_budget_authority_roots()?;
-                let workspace =
-                    std::fs::canonicalize(tool_context.cwd.as_path()).map_err(|error| {
-                        xai_grok_agent::AgentBuildError::InvalidConfig(format!(
-                            "hard-token-budget workspace is unavailable: {error}"
-                        ))
-                    })?;
-                if roots
-                    .iter()
-                    .any(|root| root.starts_with(&workspace) || workspace.starts_with(root))
-                {
-                    return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
-                        "hard-token-budget authority and workspace directories must be disjoint"
-                            .to_string(),
-                    ));
-                }
-                (roots, Some(workspace))
-            }
-            Ok(None) => {
-                return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
-                    "hard-token-budget restriction is active without a complete contract"
-                        .to_string(),
-                ));
-            }
-            Err(error) => {
-                return Err(xai_grok_agent::AgentBuildError::InvalidConfig(format!(
-                    "hard-token-budget contract is invalid: {error}"
-                )));
-            }
+        require_active_hard_budget_authority()?;
+        let roots = hard_budget_authority_roots()?;
+        let workspace = std::fs::canonicalize(tool_context.cwd.as_path()).map_err(|error| {
+            xai_grok_agent::AgentBuildError::InvalidConfig(format!(
+                "hard-token-budget workspace is unavailable: {error}"
+            ))
+        })?;
+        if roots
+            .iter()
+            .any(|root| root.starts_with(&workspace) || workspace.starts_with(root))
+        {
+            return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
+                "hard-token-budget authority and workspace directories must be disjoint"
+                    .to_string(),
+            ));
         }
+        (roots, Some(workspace))
     } else {
         (Vec::new(), None)
     };

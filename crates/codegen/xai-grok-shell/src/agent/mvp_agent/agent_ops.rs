@@ -94,8 +94,11 @@ impl MvpAgent {
     pub(super) fn build_summary_client(
         &self,
         primary: &SamplingConfig,
-    ) -> Result<(OaiCompatClient, String), acp::Error> {
+    ) -> Result<(Option<OaiCompatClient>, String), acp::Error> {
         let slug = self.resolve_session_summary_model();
+        if xai_grok_tools::util::hard_budget_environment_present() {
+            return Ok((None, slug));
+        }
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
         let endpoints = self.models_manager.endpoints();
@@ -133,7 +136,7 @@ impl MvpAgent {
         };
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
-        Ok((client, model))
+        Ok((Some(client), model))
     }
     fn has_proxy_credentials(&self) -> bool {
         self.cfg.borrow().endpoints.deployment_key.is_some()

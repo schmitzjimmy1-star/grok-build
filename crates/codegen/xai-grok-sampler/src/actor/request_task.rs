@@ -82,6 +82,7 @@ pub(crate) async fn run_request_task(
     request_id: RequestId,
     request: ConversationRequest,
     config: SamplerConfig,
+    mut client: SamplingClient,
     retry_policy: RetryPolicy,
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: CancellationToken,
@@ -94,16 +95,6 @@ pub(crate) async fn run_request_task(
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
     );
     let configured_max_retries = config.max_retries.or(Some(retry_policy.max_retries));
-    // Build the initial client. Configuration errors here are fatal
-    // (no point retrying with the same broken config).
-    let mut client = match SamplingClient::new(config.clone()) {
-        Ok(c) => c,
-        Err(err) => {
-            emit_failed(&event_tx, &request_id, &err);
-            send_completion(&mut completion_tx, Err(err));
-            return request_id;
-        }
-    };
     // A retry is a second potentially billable provider dispatch. The first
     // hard-budget release forbids automatic retries; callers may issue a new
     // explicit request only after the prior reservation is reconciled.
@@ -446,16 +437,22 @@ async fn apply_retry_decision(
             // HTTP/2 connection pools.
             let mut http1_config = config.clone();
             http1_config.force_http1 = true;
-            match SamplingClient::new(http1_config) {
-                Ok(fresh) => {
-                    *client = fresh;
-                    tracing::info!("rebuilt sampling client with HTTP/1.1 fallback for retry");
-                }
-                Err(rebuild_err) => {
-                    tracing::warn!(
-                        error = %rebuild_err,
-                        "failed to rebuild HTTP/1.1 client for retry; reusing existing client"
-                    );
+            if client.hard_token_budget_enabled() {
+                tracing::info!(
+                    "armed v3 reuses the cached sampling client instead of rebuilding on retry"
+                );
+            } else {
+                match SamplingClient::from_process_config(http1_config) {
+                    Ok(fresh) => {
+                        *client = fresh;
+                        tracing::info!("rebuilt sampling client with HTTP/1.1 fallback for retry");
+                    }
+                    Err(rebuild_err) => {
+                        tracing::warn!(
+                            error = %rebuild_err,
+                            "failed to rebuild HTTP/1.1 client for retry; reusing existing client"
+                        );
+                    }
                 }
             }
             true

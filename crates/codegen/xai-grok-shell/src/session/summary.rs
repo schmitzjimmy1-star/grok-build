@@ -24,7 +24,7 @@ enum State {
 
 /// Dependencies for session title generation and fan-out.
 pub(crate) struct SummaryConfig {
-    pub(crate) sampling_client: OaiCompatClient,
+    pub(crate) sampling_client: Option<OaiCompatClient>,
     pub(crate) model: String,
     /// Channel back to the persistence actor for sequential storage writes.
     /// Weak: a strong sender here would keep the actor's own channel and task alive.
@@ -70,7 +70,9 @@ impl SummaryGenerator {
                 // don't spawn duplicate title generation tasks.
                 self.state = State::Done;
 
-                if xai_grok_tools::util::hard_budget_environment_present() {
+                if self.config.sampling_client.is_none()
+                    || xai_grok_tools::util::hard_budget_environment_present()
+                {
                     let title =
                         crate::session::helpers::session_summary::title_fallback_from_user_text(
                             &content,
@@ -81,7 +83,11 @@ impl SummaryGenerator {
                     return;
                 }
 
-                let sampling_client = self.config.sampling_client.clone();
+                let sampling_client = self
+                    .config
+                    .sampling_client
+                    .clone()
+                    .expect("disabled summary client already returned");
                 let model = self.config.model.clone();
                 let persistence_tx = self.config.persistence_tx.clone();
 
@@ -245,10 +251,8 @@ mod tests {
     #[test]
     fn reset_returns_generator_to_idle() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let sampling_client =
-            OaiCompatClient::new(xai_grok_sampler::SamplerConfig::default()).unwrap();
         let mut generator = SummaryGenerator::new(SummaryConfig {
-            sampling_client,
+            sampling_client: None,
             model: String::new(),
             persistence_tx: tx.downgrade(),
         });
@@ -259,5 +263,23 @@ mod tests {
         assert!(generator.is_idle());
         generator.reset();
         assert!(generator.is_idle());
+    }
+
+    #[test]
+    fn omitted_sampling_client_uses_text_fallback_without_constructing_a_client() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut generator = SummaryGenerator::new(SummaryConfig {
+            sampling_client: None,
+            model: "must-not-be-called".into(),
+            persistence_tx: tx.downgrade(),
+        });
+        generator.update("Hello from the first user prompt today".into());
+        match rx.try_recv() {
+            Ok(PersistenceMsg::GeneratedTitle(title)) => {
+                assert_eq!(title, "Hello from the first user prompt today");
+            }
+            other => panic!("expected fallback title, got {other:?}"),
+        }
+        assert!(!generator.is_idle());
     }
 }

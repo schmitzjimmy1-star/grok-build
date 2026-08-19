@@ -143,6 +143,9 @@ struct Inner {
     /// Set once the user explicitly picks a model (`/model`); guards the
     /// first-catalog reselect from clobbering that choice.
     user_selected_model: AtomicBool,
+    /// Monotonic credential-free config identity. Separate from catalog
+    /// fetch-generation fencing.
+    config_identity: parking_lot::Mutex<xai_grok_sampler::ResolvedConfigIdentityTracker>,
 }
 
 /// Clears an in-flight flag on drop so a panicking task can't wedge future refreshes.
@@ -266,7 +269,7 @@ impl ModelsManagerBuilder {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
         let current_reasoning_effort = self.cfg.models.default_reasoning_effort;
-        ModelsManager {
+        let mgr = ModelsManager {
             inner: Arc::new(Inner {
                 catalog: RwLock::new(CatalogState {
                     prefetched: self.prefetched,
@@ -287,8 +290,14 @@ impl ModelsManagerBuilder {
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
                 user_selected_model: AtomicBool::new(false),
+                config_identity: parking_lot::Mutex::new(
+                    xai_grok_sampler::ResolvedConfigIdentityTracker::new(),
+                ),
             }),
-        }
+        };
+        let models = mgr.inner.catalog.read().models.clone();
+        mgr.observe_resolved_catalog(&models);
+        mgr
     }
 }
 
@@ -301,6 +310,16 @@ impl ModelsManager {
         cfg: config::Config,
     ) -> Self {
         ModelsManagerBuilder::new(prefetched, models, current_model_id, auth_manager, cfg).build()
+    }
+
+    fn observe_resolved_catalog(&self, models: &IndexMap<String, ModelEntry>) {
+        let projection =
+            crate::agent::hard_budget_runtime::credential_free_model_projection(models);
+        self.inner.config_identity.lock().observe(&projection);
+    }
+
+    pub(crate) fn tracked_config_generation(&self) -> Option<u64> {
+        self.inner.config_identity.lock().current()
     }
 
     /// Subscribe to model-switch events. Returns a `watch::Receiver`
@@ -409,8 +428,9 @@ impl ModelsManager {
             if has_real_catalog {
                 cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
             }
-            cat.models = new_catalog;
+            cat.models = new_catalog.clone();
         }
+        self.observe_resolved_catalog(&new_catalog);
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
         let mut campaign_defaults = std::collections::HashSet::new();
@@ -531,7 +551,13 @@ impl ModelsManager {
     /// Test-only catalog poke: inserts a `ModelEntry` keyed by `id`,
     #[cfg(test)]
     pub(crate) fn insert_test_entry(&self, id: impl Into<String>, entry: ModelEntry) {
-        self.inner.catalog.write().models.insert(id.into(), entry);
+        {
+            let mut cat = self.inner.catalog.write();
+            cat.models.insert(id.into(), entry);
+            let models = cat.models.clone();
+            drop(cat);
+            self.observe_resolved_catalog(&models);
+        }
     }
 
     pub(crate) fn current_reasoning_effort(&self) -> Option<ReasoningEffort> {
@@ -669,7 +695,9 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
+        let models = resolve_model_catalog(cfg, prefetched);
+        self.inner.catalog.write().models = models.clone();
+        self.observe_resolved_catalog(&models);
     }
 
     /// Reset to this identity's bundled catalog and reselect a valid default.
@@ -1201,7 +1229,7 @@ impl ModelsManager {
         new_etag: Option<String>,
         generation: Option<u64>,
     ) -> bool {
-        let (first_real_catalog, excludes_all) = {
+        let (first_real_catalog, excludes_all, published) = {
             let mut cat = self.inner.catalog.write();
             if let Some(generation) = generation
                 && cat.generation != generation
@@ -1219,8 +1247,13 @@ impl ModelsManager {
             self.inner
                 .catalog_progress
                 .send_replace(CatalogProgress::Ready);
-            (first_real_catalog, cat.allowlist_excludes_all)
+            (
+                first_real_catalog,
+                cat.allowlist_excludes_all,
+                cat.models.clone(),
+            )
         };
+        self.observe_resolved_catalog(&published);
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
         }

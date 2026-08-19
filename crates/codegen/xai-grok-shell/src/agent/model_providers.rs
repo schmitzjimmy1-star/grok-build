@@ -252,6 +252,7 @@ mod tests {
         assert!(cfg.model_providers.contains_key("gateway"));
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("via-gateway").expect("model should exist");
+        assert_eq!(model.model_provider.as_deref(), Some("gateway"));
         assert_eq!(model.info.base_url, "https://gateway.example/v1");
         assert_eq!(model.info.context_window.get(), 123456);
         assert_eq!(
@@ -401,6 +402,7 @@ mod tests {
         );
         let resolved = resolve_model_list(&cfg, None);
         let model = resolved.get("dangling").expect("model should exist");
+        assert_eq!(model.model_provider.as_deref(), Some("ghost"));
         assert_eq!(
             model.info.base_url, "https://third-party.example/v1",
             "the model keeps its own connection fields"

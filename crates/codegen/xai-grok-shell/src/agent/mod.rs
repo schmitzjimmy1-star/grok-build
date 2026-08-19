@@ -8,6 +8,7 @@ mod ext_parsers;
 pub mod feedback_client;
 pub mod folder_trust;
 pub(crate) mod handlers;
+pub(crate) mod hard_budget_runtime;
 pub mod init;
 pub mod model_providers;
 pub mod models;

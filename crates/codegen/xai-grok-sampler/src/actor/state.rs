@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::client::SamplingClient;
 use crate::config::{RetryPolicy, SamplerConfig};
 use crate::types::RequestId;
 
@@ -26,6 +27,11 @@ pub(crate) struct ActorState {
     pub(crate) active_requests: HashMap<RequestId, ActiveRequest>,
     pub(crate) config: SamplerConfig,
     pub(crate) retry_policy: RetryPolicy,
+    /// One lazily constructed armed client. Unarmed requests never populate
+    /// this; a second armed request clones it instead of reclaiming the
+    /// one-shot credential.
+    pub(crate) armed_client: Option<SamplingClient>,
+    pub(crate) armed_config: Option<SamplerConfig>,
 }
 
 impl ActorState {
@@ -34,6 +40,8 @@ impl ActorState {
             active_requests: HashMap::new(),
             config,
             retry_policy,
+            armed_client: None,
+            armed_config: None,
         }
     }
 
@@ -66,16 +74,64 @@ impl ActorState {
     }
 
     /// Replace the default config. The next request submitted without
-    /// an override will use this.
+    /// an override will use this. Armed v3 ignores route-changing updates
+    /// so a later model/host switch cannot replace the bound client.
     pub(crate) fn update_config(&mut self, config: SamplerConfig) {
+        if self.armed_client.is_some()
+            && self
+                .armed_config
+                .as_ref()
+                .is_some_and(|armed| armed_route_drifted(armed, &config))
+        {
+            tracing::warn!("armed v3 ignored a route-changing sampler config update");
+            return;
+        }
         self.config = config;
     }
+}
+
+pub(crate) fn armed_route_drifted(bound: &SamplerConfig, incoming: &SamplerConfig) -> bool {
+    bound.base_url != incoming.base_url
+        || bound.model != incoming.model
+        || bound.api_backend != incoming.api_backend
+        || bound.auth_scheme != incoming.auth_scheme
+        || bound.api_key.is_some() != incoming.api_key.is_some()
+        || bound.extra_headers != incoming.extra_headers
+        || bound.query_params != incoming.query_params
+        || bound.env_http_headers != incoming.env_http_headers
+}
+
+pub(crate) fn acquire_request_client(
+    state: &mut ActorState,
+    config: SamplerConfig,
+) -> Result<SamplingClient, xai_grok_sampling_types::SamplingError> {
+    if crate::hard_budget::active_v3_authority().is_some() {
+        if let Some(client) = &state.armed_client {
+            if state
+                .armed_config
+                .as_ref()
+                .is_some_and(|bound| armed_route_drifted(bound, &config))
+            {
+                return Err(
+                    xai_grok_sampling_types::SamplingError::InvalidConfiguration(
+                        "armed v3 rejects route-changing sampler updates",
+                    ),
+                );
+            }
+            return Ok(client.clone());
+        }
+        let client = SamplingClient::from_process_config(config.clone())?;
+        state.armed_client = Some(client.clone());
+        state.armed_config = Some(config);
+        return Ok(client);
+    }
+    SamplingClient::from_process_config(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::ApiBackend;
+    use crate::client::{ApiBackend, SamplingClient};
     use indexmap::IndexMap;
 
     /// Minimal config builder for tests in this module.
@@ -147,5 +203,48 @@ mod tests {
         };
         assert!(state.register(id.clone(), first).is_none());
         assert!(state.register(id.clone(), second).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn armed_acquire_caches_one_client_and_rejects_route_drift() {
+        use crate::armed_credential::{ArmedCredentialOwner, install_armed_credential_owner};
+        use crate::client::exact_loopback_endpoint_sha256;
+        use crate::config::AuthScheme;
+        use crate::hard_budget::v3_test_support;
+        use zeroize::Zeroizing;
+
+        let _guard = v3_test_support::lock();
+        let dir = v3_test_support::private_dir("actor-armed-cache");
+        let loopback = "http://127.0.0.1:9/v1".to_string();
+        let mut route = v3_test_support::route();
+        route.api_backend = "responses".into();
+        route.provider_facing_model = "test-model".into();
+        route.endpoint_sha256 = exact_loopback_endpoint_sha256(&loopback, "responses").unwrap();
+        install_armed_credential_owner(
+            ArmedCredentialOwner::from_receiver(Zeroizing::new(b"fake-sentinel".to_vec())).unwrap(),
+        )
+        .unwrap();
+        let _authority = v3_test_support::activate_with_route(&dir, route);
+        let cfg = SamplerConfig {
+            base_url: loopback.clone(),
+            model: "test-model".into(),
+            api_backend: ApiBackend::Responses,
+            auth_scheme: AuthScheme::Bearer,
+            max_retries: Some(0),
+            ..SamplerConfig::default()
+        };
+        let mut state = ActorState::new(cfg.clone(), RetryPolicy::default());
+        let first = acquire_request_client(&mut state, cfg.clone()).expect("first armed client");
+        assert!(first.hard_token_budget_enabled());
+        let _second = acquire_request_client(&mut state, cfg.clone()).expect("cached clone");
+        assert!(SamplingClient::from_process_config(cfg.clone()).is_err());
+
+        let mut drifted = cfg.clone();
+        drifted.base_url = "http://127.0.0.1:8/v1".into();
+        assert!(acquire_request_client(&mut state, drifted.clone()).is_err());
+        state.update_config(drifted);
+        assert_eq!(state.config.base_url, loopback);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
