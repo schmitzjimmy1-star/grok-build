@@ -558,9 +558,13 @@ mod tests {
         sender.join().unwrap();
     }
 
+    // Darwin honesty: this proves FD 198 is closed before a raw fork, and that
+    // the forked child can call setsid(). A descendant that setsid() after
+    // ProcessScope enrollment keeps a different pgid; killpg of the enrolled
+    // group will not reap it. That post-spawn escape is the known 4B.2 limit.
     #[cfg(target_os = "macos")]
     #[test]
-    fn receiver_closes_fd_before_raw_fork_and_setsid_descendant() {
+    fn hard_budget_receiver_closes_fd_before_raw_fork_and_setsid_descendant() {
         let (receiver, peer) = socket_pair();
         let sender = peer_handshake(peer, b"fork-proof".to_vec());
         let _fd_guard = ReceiverFdGuard::replace_with(receiver.as_raw_fd());
